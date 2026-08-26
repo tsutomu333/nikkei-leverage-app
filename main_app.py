@@ -15,19 +15,25 @@ p_usd = st.sidebar.slider("ドル円の許容下落幅(%)", min_value=-2.0, max_
 
 ignore_event = st.sidebar.checkbox("⚠️ 本日の重要イベント警告を無視して強制判定する", value=False)
 
-# --- 2. 最新データの取得 ---
+# --- 2. 最新データの取得（エラー防止の安全設計） ---
 @st.cache_data(ttl=600)
 def get_today_market_data():
-    t_vix = yf.download("^VIX", period="5d", progress=False)
+    # 期間を1ヶ月に広げることで、休日や祝日を挟んでも確実に直近データが取得できるようにする
+    t_vix = yf.download("^VIX", period="1mo", progress=False)
     time.sleep(0.5)
-    t_usd = yf.download("USDJPY=X", period="5d", progress=False)
+    t_usd = yf.download("USDJPY=X", period="1mo", progress=False)
     time.sleep(0.5)
-    t_n225 = yf.download("^N225", period="5d", progress=False)
+    t_n225 = yf.download("^N225", period="1mo", progress=False)
 
     for df in [t_vix, t_usd, t_n225]:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df.index = df.index.tz_localize(None)
+
+    # 有効なデータに絞る
+    t_vix = t_vix.dropna()
+    t_usd = t_usd.dropna()
+    t_n225 = t_n225.dropna()
 
     latest_vix = t_vix['Close'].iloc[-1]
     usd_pct = (t_usd['Close'].iloc[-1] - t_usd['Close'].iloc[-2]) / t_usd['Close'].iloc[-2] * 100
@@ -36,7 +42,7 @@ def get_today_market_data():
     n225_prev_close = t_n225['Close'].iloc[-2]
     gap_open = (n225_open - n225_prev_close) / n225_prev_close * 100
 
-    return latest_vix, usd_pct, gap_open
+    return float(latest_vix), float(usd_pct), float(gap_open)
 
 with st.spinner("最新の市場データと経済イベントをチェック中..."):
     try:
@@ -50,7 +56,6 @@ cond_vix = vix_val < p_vix
 cond_usd = usd_val > p_usd
 cond_gap = gap_val >= p_gap
 
-# イベント判定（必要に応じて拡張可能）
 has_major_event = False 
 event_message = "本日は日中・夜間に警戒すべき超重要米経済指標の予定はありません。"
 
@@ -96,31 +101,26 @@ st.subheader("💡 【AI判定解説】本日のトレード根拠")
 
 reasons = []
 
-# 窓開けの解説
 if cond_gap:
     reasons.append(f"- **朝の窓開け（+{gap_val:.2f}%）：** 設定基準（+{p_gap}%以上）をクリアしており、今朝はしっかりとした買いの勢い（モメンタム）を持ってスタートしています。")
 else:
     reasons.append(f"- **朝の窓開け（+{gap_val:.2f}%）：** 設定基準（+{p_gap}%以上）に届いておらず、朝の初動の勢いが弱いためダマシのリスクがあります。")
 
-# ドル円の解説
 if cond_usd:
     reasons.append(f"- **為替・ドル円（{usd_val:+.2f}%）：** 許容下落幅（{p_usd}%）の範囲内に収まっており、極端な円高による日本株への下押し圧力は大きくありません。")
 else:
     reasons.append(f"- **為替・ドル円（{usd_val:+.2f}%）：** 急激な円高が進行しており、投資家心理にマイナスに働く恐れがあるため見送りが妥当です。")
 
-# VIXの解説
 if cond_vix:
     reasons.append(f"- **恐怖指数VIX（{vix_val:.2f}）：** 上限ライン（{p_vix}）を下回っており、市場全体が比較的落ち着いた正常な状態にあります。")
 else:
     reasons.append(f"- **恐怖指数VIX（{vix_val:.2f}）：** 市場にパニックや大きな警戒感が広がっているため、予測不能な乱高下に巻き込まれる危険があります。")
 
-# イベントの解説
 if has_major_event and not ignore_event:
     reasons.append(f"- **重要イベント：** 本日は相場を大きく動かすイベントが控えているため、ポジションを持ち越す・残すリスクを避ける必要があります。")
 else:
     reasons.append(f"- **重要イベント：** 本日は日中の値動きを大きく歪めるような主要イベントの直撃リスクは低い状態です。")
 
-# 解説文のまとめ出力
 for r in reasons:
     st.write(r)
 
