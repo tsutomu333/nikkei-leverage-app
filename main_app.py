@@ -4,8 +4,8 @@ import pandas as pd
 from datetime import datetime
 import time
 
-st.title("🚦 日中デイトレ・リアルタイム買い判断アプリ（解説付き）")
-st.write("VIX・ドル円・朝の窓開け・重要イベントの状況を自動判定し、エントリーの根拠（解説）を詳しく提示します。")
+st.title("🚦 日中デイトレ・リアルタイム買い判断アプリ（事前気配値対応版）")
+st.write("朝8:40以降の板（気配値）や最新データを自動取得し、9:00の寄り付き前にエントリー判断と解説を行います。")
 
 # --- 1. サイドバー：判定ルールの設定 ---
 st.sidebar.header("⚙️ 判定ルールの設定（しきい値）")
@@ -15,38 +15,38 @@ p_usd = st.sidebar.slider("ドル円の許容下落幅(%)", min_value=-2.0, max_
 
 ignore_event = st.sidebar.checkbox("⚠️ 本日の重要イベント警告を無視して強制判定する", value=False)
 
-# --- 2. 最新データの取得（エラー防止の安全設計） ---
-@st.cache_data(ttl=600)
-def get_today_market_data():
-    # 期間を1ヶ月に広げることで、休日や祝日を挟んでも確実に直近データが取得できるようにする
+# --- 2. 最新データと気配値の取得 ---
+@st.cache_data(ttl=300) # 5分ごとにキャッシュ更新
+def get_morning_market_data():
     t_vix = yf.download("^VIX", period="1mo", progress=False)
     time.sleep(0.5)
     t_usd = yf.download("USDJPY=X", period="1mo", progress=False)
     time.sleep(0.5)
-    t_n225 = yf.download("^N225", period="1mo", progress=False)
+    t_1570 = yf.download("1570.T", period="1mo", progress=False) # 1570（NEXT FUNDS 日経レバレッジ・インデックス上場投信）
 
-    for df in [t_vix, t_usd, t_n225]:
+    for df in [t_vix, t_usd, t_1570]:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df.index = df.index.tz_localize(None)
 
-    # 有効なデータに絞る
     t_vix = t_vix.dropna()
     t_usd = t_usd.dropna()
-    t_n225 = t_n225.dropna()
+    t_1570 = t_1570.dropna()
 
     latest_vix = t_vix['Close'].iloc[-1]
     usd_pct = (t_usd['Close'].iloc[-1] - t_usd['Close'].iloc[-2]) / t_usd['Close'].iloc[-2] * 100
     
-    n225_open = t_n225['Open'].iloc[-1]
-    n225_prev_close = t_n225['Close'].iloc[-2]
-    gap_open = (n225_open - n225_prev_close) / n225_prev_close * 100
+    # 1570の「今日の気配値（Open）」と「前日の終値（Closeのiloc[-2]))」を比較して窓開けを計算
+    # 朝の早い時間帯でもOpenにその日の予想気配値/始値が入ってきます
+    target_open = t_1570['Open'].iloc[-1]
+    prev_close = t_1570['Close'].iloc[-2]
+    gap_open = (target_open - prev_close) / prev_close * 100
 
     return float(latest_vix), float(usd_pct), float(gap_open)
 
-with st.spinner("最新の市場データと経済イベントをチェック中..."):
+with st.spinner("朝の板情報と市場データをチェック中..."):
     try:
-        vix_val, usd_val, gap_val = get_today_market_data()
+        vix_val, usd_val, gap_val = get_morning_market_data()
     except Exception as e:
         st.error(f"データの取得に失敗しました: {e}")
         st.stop()
@@ -68,19 +68,19 @@ else:
 st.markdown("---")
 
 if is_go:
-    st.success("🟢 **【判定：GO! 仕込み推奨】すべての安全フィルターと条件をクリアしています！**")
+    st.success("🟢 **【判定：GO! 仕込み推奨】すべての安全フィルターと条件をクリアしています！寄成注文の準備をどうぞ。**")
 else:
     if has_major_event and not ignore_event:
         st.warning("🚨 **【判定：強制見送り】本日は超重要経済指標の発表が予定されているため、見送りとします。**")
     else:
         st.warning("🔴 **【判定：見送り推奨】一部の条件を満たしていないため、本日は手控えましょう。**")
 
-st.markdown("### 📋 本日の指標チェック結果")
+st.markdown("### 📋 本日の指標チェック結果（1570ベース）")
 
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    st.metric("③ 朝の窓開け", f"{gap_val:+.2f}%", f"基準: +{p_gap}%以上")
+    st.metric("③ 朝の窓開け(1570)", f"{gap_val:+.2f}%", f"基準: +{p_gap}%以上")
     st.write("✅ クリア" if cond_gap else "❌ 未達")
 
 with col2:
@@ -102,9 +102,9 @@ st.subheader("💡 【AI判定解説】本日のトレード根拠")
 reasons = []
 
 if cond_gap:
-    reasons.append(f"- **朝の窓開け（+{gap_val:.2f}%）：** 設定基準（+{p_gap}%以上）をクリアしており、今朝はしっかりとした買いの勢い（モメンタム）を持ってスタートしています。")
+    reasons.append(f"- **1570の朝の窓開け（+{gap_val:.2f}%）：** 設定基準（+{p_gap}%以上）をクリアしており、板の気配値から見て今朝はしっかりとした買いの勢い（モメンタム）が確認できます。")
 else:
-    reasons.append(f"- **朝の窓開け（+{gap_val:.2f}%）：** 設定基準（+{p_gap}%以上）に届いておらず、朝の初動の勢いが弱いためダマシのリスクがあります。")
+    reasons.append(f"- **1570の朝の窓開け（+{gap_val:.2f}%）：** 設定基準（+{p_gap}%以上）に届いておらず、朝の初動の勢いが弱いためダマシのリスクがあります。")
 
 if cond_usd:
     reasons.append(f"- **為替・ドル円（{usd_val:+.2f}%）：** 許容下落幅（{p_usd}%）の範囲内に収まっており、極端な円高による日本株への下押し圧力は大きくありません。")
@@ -125,6 +125,6 @@ for r in reasons:
     st.write(r)
 
 if is_go:
-    st.info("🎯 **総括：** すべての条件が綺麗な形で噛み合っています。朝の寄り付きから15:00の引けにかけて、順張りでのデイトレードを検討する絶好のチャンスです。")
+    st.info("🎯 **総括：** 8:40以降の板の気配値を含めてすべての条件が揃っています。8:55頃までに1570の「寄成」注文をセットする絶好のチャンスです。")
 else:
-    st.warning("⚠️ **総括：** いずれかの条件が基準を満たしていない、あるいはリスク要因があります。無理にエントリーせず、次のチャンスを待ちましょう。")
+    st.warning("⚠️ **総括：** 条件を満たしていない項目があります。無理にエントリーせず、次のチャンスを待ちましょう。")
