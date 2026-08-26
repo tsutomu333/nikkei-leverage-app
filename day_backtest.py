@@ -4,14 +4,14 @@ import pandas as pd
 from datetime import datetime
 import time
 
-st.title("【NEW】日中デイトレ検証アプリ（完全版）")
-st.write("VIX・ドル円・朝の窓開け基準値を調整して日中戦略をテストします。")
+st.title("日中デイトレ戦略（安全フィルター ＋ 窓開け）検証ダッシュボード")
+st.write("VIX・ドル円の安全フィルターと、朝の強い窓開けを組み合わせたデイトレ戦略を検証します。")
 
-# --- 1. サイドバー：パラメータ調整（必ずここに③のスライダーが出ます） ---
+# --- 1. サイドバー：パラメータ調整 ---
 st.sidebar.header("⚙️ デイトレ戦略の条件設定")
 
 # ③ 朝の窓開け基準値スライダー
-p_gap = st.sidebar.slider("③ 朝の窓開け基準値(%) ［厳しめ］", min_value=0.0, max_value=2.0, value=0.5, step=0.1)
+p_gap = st.sidebar.slider("③ 朝の窓開け基準値(%) ［厳しめ］", min_value=0.0, max_value=2.0, value=0.2, step=0.1)
 
 p_vix = st.sidebar.slider("VIX(恐怖指数)の上限", min_value=15.0, max_value=35.0, value=20.0, step=0.5)
 p_usd = st.sidebar.slider("ドル円の許容下落幅(%)", min_value=-2.0, max_value=0.0, value=-0.5, step=0.1)
@@ -21,8 +21,8 @@ years = list(range(2018, datetime.now().year + 1))
 months = list(range(1, 13))
 
 col_y1, col_m1 = st.sidebar.columns(2)
-start_year = col_y1.selectbox("開始 年", years, index=0)
-start_month = col_m1.selectbox("開始 月", months, index=0)
+start_year = col_y1.selectbox("開始 年", years, index=len(years)-2) # デフォルトで直近付近に
+start_month = col_m1.selectbox("開始 月", months, index=8) # 9月頃
 
 col_y2, col_m2 = st.sidebar.columns(2)
 end_year = col_y2.selectbox("終了 年", years, index=len(years)-1)
@@ -95,8 +95,8 @@ st.header(f"📊 デイトレ検証結果 （期間: {start_year}年{start_month
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("総トレード回数", f"{total_trades} 回")
 col2.metric("勝率", f"{win_rate:.1f}%" if total_trades > 0 else "0%")
-# 文字がはみ出さないように「勝ち数 / 負け数」をスッキリ分割表示
-col3.metric("勝ち数 / 負け数", f"{win_count}勝 / {lose_count}敗")
+# 表記をすっきり短くしてハミ出しを完全防止
+col3.metric("勝敗 (勝/敗)", f"{win_count}勝 / {lose_count}敗")
 col4.metric("累積リターン", f"{total_return:+.2f}%")
 
 st.markdown("---")
