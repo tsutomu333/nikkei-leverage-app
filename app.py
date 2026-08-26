@@ -1,107 +1,159 @@
 import streamlit as st
 import yfinance as yf
-import pandas as pd
-from datetime import datetime
+import requests
+import xml.etree.ElementTree as ET
+import datetime
 
-st.title("日経レバ 持ち越し判定アプリ（リアルタイム・ダッシュボード）")
-st.write("今日の夕方15:25時点の市場データが、検証済みの『勝ちパターン』を満たしているかを判定します。")
+# --- データ取得用の関数 ---
+def get_market_data(ticker_symbol, is_pct=True):
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        hist = ticker.history(period="5d")
+        if len(hist) < 2: return 0.0
+        current_price = hist['Close'].iloc[-1]
+        if not is_pct: return round(current_price, 2)
+        prev_close = hist['Close'].iloc[-2]
+        return round(((current_price - prev_close) / prev_close) * 100, 2)
+    except:
+        return 0.0
 
-# --- データの取得（直近の動きを見るため短期間取得） ---
-@st.cache_data(ttl=60) # 60秒ごとにキャッシュを更新
-def get_latest_data():
-    t_nq = yf.Ticker("NQ=F").history(period="5d")
-    t_sox = yf.Ticker("^SOX").history(period="5d")
-    t_usd = yf.Ticker("USDJPY=X").history(period="5d")
-    t_vix = yf.Ticker("^VIX").history(period="5d")
+def check_us_macro_events():
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=5)
+        root = ET.fromstring(response.content)
+        today_str = datetime.datetime.now().strftime("%m-%d-%Y")
+        
+        event_names = []
+        for event in root.findall('event'):
+            country = event.find('country').text
+            impact = event.find('impact').text
+            date_str = event.find('date').text
+            if country == 'USD' and impact == 'High' and date_str == today_str:
+                event_names.append(event.find('title').text)
+        return len(event_names) > 0, event_names
+    except:
+        return False, ["※取得エラー：手動で確認してください"]
 
-    t_nq.index = t_nq.index.tz_localize(None)
-    t_sox.index = t_sox.index.tz_localize(None)
-    t_usd.index = t_usd.index.tz_localize(None)
-    t_vix.index = t_vix.index.tz_localize(None)
+# --- 画面描画 ---
+st.title("日経レバ 仕込み判定ダッシュボード")
+st.write("15:00〜15:25の間に確認し、明日の寄り付きに向けた仕込みを判定します。")
+st.markdown("---")
 
-    df = pd.DataFrame({
-        'NQ_Close': t_nq['Close'],
-        'SOX_Close': t_sox['Close'],
-        'USD_Close': t_usd['Close'],
-        'VIX_Close': t_vix['Close']
-    }).dropna()
-
-    df['NQ_pct'] = df['NQ_Close'].pct_change() * 100
-    df['SOX_pct'] = df['SOX_Close'].pct_change() * 100
-    df['USD_pct'] = df['USD_Close'].pct_change() * 100
-
-    return df.iloc[-1] # 一番直近（今日）のデータを取得
-
-try:
-    today_data = get_latest_data()
-except Exception as e:
-    st.error(f"データの取得に失敗しました: {e}")
-    st.stop()
-
-# --- 左側のメニュー（判定基準の調整 / バックテストの黄金バランスを初期値に） ---
+# --- 左側のメニュー（黄金バランスを初期値にしたカスタム調整） ---
 st.sidebar.header("⚙️ 判定ルールの設定")
-st.sidebar.write("バックテストで検証した基準を初期値にしています。必要に応じて微調整可能です。")
+st.sidebar.write("バックテストで検証した黄金バランスを初期値にしています。")
 
 p_nq = st.sidebar.slider("ナスダックの基準値(%)", min_value=-1.0, max_value=2.0, value=0.1, step=0.1)
 p_vix = st.sidebar.slider("VIX(恐怖指数)の上限", min_value=15.0, max_value=35.0, value=20.0, step=0.5)
 p_usd = st.sidebar.slider("ドル円の許容下落幅(%)", min_value=-2.0, max_value=0.0, value=-0.5, step=0.1)
 p_sox = st.sidebar.slider("SOX指数の基準値(%)", min_value=-2.0, max_value=3.0, value=0.1, step=0.1)
 
-# --- 今日の数値の取り出し ---
-nq_val = today_data['NQ_pct']
-vix_val = today_data['VIX_Close']
-usd_val = today_data['USD_pct']
-sox_val = today_data['SOX_pct']
+# --- データの取得 ---
+with st.spinner("最新のマーケットデータと経済指標を取得中..."):
+    has_macro_event, event_list = check_us_macro_events()
+    nasdaq_pct = get_market_data("NQ=F", True)
+    sox_pct = get_market_data("^SOX", True)
+    usdjpy_pct = get_market_data("USDJPY=X", True)
+    vix_value = get_market_data("^VIX", False)
 
-# --- 条件の判定 ---
-cond_nq = nq_val >= p_nq
-cond_vix = vix_val < p_vix
-cond_usd = usd_val > p_usd
-cond_sox = sox_val >= p_sox
-
-is_all_clear = cond_nq and cond_vix and cond_usd and cond_sox
-
-# --- 画面への表示 ---
-st.header("🚦 本日のエントリー判定結果")
-
-if is_all_clear:
-    st.success("【 判定：買いシグサル点灯 (GO) 】すべての条件クリア！今日の夕方に日経レバを買い、翌朝に売りましょう。")
+# --- 1. 経済指標の自動取得表示 ---
+st.header("1. 今夜の米国イベント（自動判定）")
+if has_macro_event:
+    st.error("🚨 【警告】今夜、以下の重要指標発表が予定されています！強制見送りとします。")
+    for e in event_list:
+        st.write(f"・ {e}")
 else:
-    st.warning("【 判定：見送り (NO GO) 】条件をクリアしていない項目があります。本日はトレードを控えましょう。")
+    st.success("🟢 今夜は相場を揺るがすような米国の重要指標（CPIやPCEなど）はありません。")
 
+st.caption("※NVIDIAなど「超大型ハイテク株の決算」は自動取得できないため、予定がある場合は下のチェックを入れてください。")
+is_tech_earnings = st.checkbox("今夜、メガテック企業の決算発表がある")
 st.markdown("---")
 
+# --- 2. マーケットデータの表示 ---
+st.header("2. 現在のマーケット動向")
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("ナスダック先物", f"{nasdaq_pct:+.2f}%")
+col2.metric("SOX(半導体)指数", f"{sox_pct:+.2f}%")
+col3.metric("ドル円 前日比", f"{usdjpy_pct:+.2f}%")
+col4.metric("VIX(恐怖指数)", f"{vix_value:.2f}")
+st.markdown("---")
+
+# --- 3. 総合判定結果 ---
+st.header("🚦 本日の総合判定結果")
+
+cond_nq = nasdaq_pct >= p_nq
+cond_vix = vix_value < p_vix
+cond_usd = usdjpy_pct > p_usd
+cond_sox = sox_pct >= p_sox
+cond_event = not (has_macro_event or is_tech_earnings)
+
+if not cond_event:
+    st.error("🚨 【総合判定：見送り】今夜は重要イベントがあります。指標ギャンブルを回避します。")
+elif not cond_vix:
+    st.error(f"🚨 【総合判定：見送り】VIXが {vix_value} と危険水域（{p_vix}以上）です。")
+elif not cond_usd:
+    st.warning(f"🟡 【総合判定：見送り】ドル円が {usdjpy_pct}% と許容下落幅（{p_usd}%）を超えて円高に振れています。")
+elif not cond_sox:
+    st.warning(f"🟡 【総合判定：見送り】SOX指数が {sox_pct}% と基準値（{p_sox}%）未満です。")
+elif not cond_nq:
+    st.warning(f"🟡 【総合判定：見送り】ナスダックが {nasdaq_pct}% と基準値（{p_nq}%）未満です。")
+else:
+    st.success("🟢 【総合判定：GO! 仕込み推奨】すべての安全フィルターをクリアしました！明日の朝9時に利確しましょう。")
+
+st.markdown("---")
 st.subheader("📋 各指標のクリア状況")
 
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.metric("ナスダック変動率", f"{nq_val:+.2f}%", f"基準: ≧{p_nq}%")
-    if cond_nq:
-        st.info("✅ クリア")
-    else:
-        st.error("❌ 未達")
-
-with col2:
-    st.metric("VIX（恐怖指数）", f"{vix_val:.2f}", f"基準: <{p_vix}")
-    if cond_vix:
-        st.info("✅ クリア")
-    else:
-        st.error("❌ 超過（危険）")
-
-with col3:
-    st.metric("ドル円変動率", f"{usd_val:+.2f}%", f"基準: >{p_usd}%")
-    if cond_usd:
-        st.info("✅ クリア")
-    else:
-        st.error("❌ 下落オーバー")
-
-with col4:
-    st.metric("SOX指数変動率", f"{sox_val:+.2f}%", f"基準: ≧{p_sox}%")
-    if cond_sox:
-        st.info("✅ クリア")
-    else:
-        st.error("❌ 未達")
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("ナスダック", f"{nasdaq_pct:+.2f}%", f"基準: ≧{p_nq}%")
+    st.info("✅ クリア" if cond_nq else "❌ 未達")
+with c2:
+    st.metric("VIX指数", f"{vix_value:.2f}", f"基準: <{p_vix}")
+    st.info("✅ クリア" if cond_vix else "❌ 超過")
+with c3:
+    st.metric("ドル円", f"{usdjpy_pct:+.2f}%", f"基準: >{p_usd}%")
+    st.info("✅ クリア" if cond_usd else "❌ 未達")
+with c4:
+    st.metric("SOX指数", f"{sox_pct:+.2f}%", f"基準: ≧{p_sox}%")
+    st.info("✅ クリア" if cond_sox else "❌ 未達")
 
 st.markdown("---")
-st.caption(f"最終データ更新タイミング（直近営業日）： {today_data.name.strftime('%Y-%m-%d %H:%M')}")
+st.header("📊 各指標の詳細と解説（学習用）")
+
+# --- 詳細解説セクション ---
+st.subheader("① 米国重要イベント")
+if not cond_event:
+    st.error("❌ 本日の状態：重要イベントあり（危険）")
+else:
+    st.success("✅ 本日の状態：イベントなし（安全）")
+st.write("**【なぜ見るの？】** CPIやPCE、巨大企業の決算などの発表直後は、プロの投資家でも予測不可能なギャンブル相場になります。過去の法則が一切通用しなくなるため、これを避けるのが勝率アップの絶対条件です。")
+
+st.subheader("② VIX（恐怖指数）")
+if cond_vix:
+    st.success(f"✅ 本日の状態：{vix_value}（安全圏）")
+else:
+    st.error(f"❌ 本日の状態：{vix_value}（{p_vix}以上の危険水域）")
+st.write("**【なぜ見るの？】** 投資家のパニック度合いを示します。通常は15前後ですが、数値が跳ね上がると相場のボラティリティ（価格の上下動）が激しくなり、夜間に突然の暴落が起きやすくなります。")
+
+st.subheader("③ ドル円（為替）の前日比")
+if cond_usd:
+    st.success(f"✅ 本日の状態：{usdjpy_pct}%（基準クリア）")
+else:
+    st.warning(f"❌ 本日の状態：{usdjpy_pct}%（急激な円高）")
+st.write("**【なぜ見るの？】** 日経平均を構成する主力企業は輸出企業が多いため、「円高」は利益が減るマイナス要因として嫌われます。米国株が上がっていても、円高が進んでいると日経平均は伸び悩みます。")
+
+st.subheader("④ SOX（半導体）指数")
+if cond_sox:
+    st.success(f"✅ 本日の状態：{sox_pct}%（基準クリア）")
+else:
+    st.warning(f"❌ 本日の状態：{sox_pct}%（基準値未満）")
+st.write("**【なぜ見るの？】** 現在の日経平均は、東京エレクトロンやアドバンテストといった「半導体関連株」の動きに指数全体が大きく引っ張られる構造になっています。日経を買うなら、その大黒柱である半導体が元気であることが重要です。")
+
+st.subheader("⑤ ナスダック100先物")
+if cond_nq:
+    st.success(f"✅ 本日の状態：{nasdaq_pct}%（基準クリア）")
+else:
+    st.warning(f"❌ 本日の状態：{nasdaq_pct}%（基準値未満）")
+st.write("**【なぜ見るの？】** 日経平均の翌朝のスタート位置を決める「メインエンジン」です。これが基準値以上の強い勢いを持っている時にだけ乗ることで、ダマシを減らし、勝てる確率の高い波だけを狙うことができます。")
