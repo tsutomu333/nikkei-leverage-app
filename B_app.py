@@ -2,11 +2,10 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="B_翌朝寄り付き研究", page_icon="🔬", layout="wide")
-
 JST = ZoneInfo("Asia/Tokyo")
 
 TICKERS = {
@@ -22,236 +21,422 @@ TICKERS = {
     "米10年金利": "^TNX",
 }
 
-FEATURE_LABELS = {
-    "n225_ret": "前日日経225騰落率",
-    "n225_close_pos": "前日日経225終値位置",
-    "topix_ret": "前日TOPIX騰落率",
-    "nq_ret": "前回米国NASDAQ100騰落率",
-    "sp_ret": "前回米国S&P500騰落率",
-    "sox_ret": "前回米国SOX騰落率",
-    "dow_ret": "前回米国NYダウ騰落率",
-    "vix_level": "前回米国VIX水準",
-    "usd_ret": "前回ドル円騰落率",
-    "tnx_ret": "前回米10年金利変化率",
-    "us_breadth": "米国4指数プラス数",
-    "nq_usd_combo": "NASDAQ100騰落率＋ドル円騰落率",
+FEATURES = {
+    "n225_ret": ("前日日経225騰落率", "日経225"),
+    "n225_close_pos": ("前日日経225終値位置", "日経225"),
+    "topix_ret": ("前日TOPIX騰落率", "TOPIX"),
+    "nq_ret": ("前回米国NASDAQ100騰落率", "NASDAQ100"),
+    "sp_ret": ("前回米国S&P500騰落率", "S&P500"),
+    "sox_ret": ("前回米国SOX騰落率", "SOX"),
+    "dow_ret": ("前回米国NYダウ騰落率", "NYダウ"),
+    "vix_level": ("前回米国VIX水準", "VIX"),
+    "usd_ret": ("前回ドル円騰落率", "ドル円"),
+    "tnx_ret": ("前回米10年金利変化率", "米10年金利"),
+    "us_breadth": ("米国4指数プラス数", "米国4指数"),
+    "nq_usd_combo": ("NASDAQ100騰落率＋ドル円騰落率", "NASDAQ×ドル円"),
 }
 
-@st.cache_data(ttl=900)
+EXPLANATIONS = {
+    "n225_ret": "日本市場そのものの前日騰落です。大きく下げた後に翌朝反発しやすいか、逆に上昇の勢いが続きやすいかを見ます。",
+    "n225_close_pos": "その日の高値〜安値のどこで日経225が引けたかです。1に近いほど高値圏、0に近いほど安値圏で引けています。",
+    "topix_ret": "日経225より広い日本株全体の動きです。日本市場全体の強弱が翌朝に残るかを見ます。",
+    "nq_ret": "直前に終了した米国NASDAQ100の騰落です。日本のハイテク・半導体株に波及しやすい情報です。",
+    "sp_ret": "直前のS&P500です。米国株全体のリスクオン・リスクオフを表す代表的な情報です。",
+    "sox_ret": "米国半導体株の動きです。日経平均への寄与が大きい日本の半導体株との関連を調べます。",
+    "dow_ret": "米国大型株の代表指数です。NASDAQとは違う業種も含むため、米国市場の広がりを確認できます。",
+    "vix_level": "市場の不安の大きさです。低いほど安全とは限らず、高い局面で翌朝反発しやすい可能性も調べます。",
+    "usd_ret": "ドル円の変化です。プラスは円安方向、マイナスは円高方向。輸出株の多い日本市場との関係を見ます。",
+    "tnx_ret": "米10年金利の変化です。金利上昇・低下が株式市場の評価や為替を通じて翌朝に影響するかを見ます。",
+    "us_breadth": "NASDAQ100・S&P500・SOX・NYダウのうち何指数が上昇したかです。米国株の上昇・下落の『広がり』を見ます。",
+    "nq_usd_combo": "NASDAQ100とドル円を足した簡易指標です。米ハイテク株と円安・円高が同時に日本株へどう効くかを見ます。",
+}
+
+@st.cache_data(ttl=1800)
 def download_daily(ticker, start, end):
-    df = yf.download(ticker, start=start, end=end, interval="1d",
-                     auto_adjust=False, progress=False, threads=False)
+    df = yf.download(
+        ticker, start=start, end=end, interval="1d",
+        auto_adjust=False, progress=False, threads=False
+    )
     if df is None or df.empty:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    return df.dropna(how="all")
+    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
+    return df.sort_index().dropna(how="all")
 
-def series_close(df):
+def close_s(df):
     if df.empty or "Close" not in df.columns:
         return pd.Series(dtype=float)
     return pd.to_numeric(df["Close"], errors="coerce").dropna()
 
+def map_prior_us_feature(jp_dates, s, name):
+    """日本日付Dに対し、Dより前に終了している直近の米国セッション値を割り当てる。"""
+    left = pd.DataFrame({"jp_date": pd.to_datetime(jp_dates).normalize()}).sort_values("jp_date")
+    right = pd.DataFrame({
+        "us_date": pd.to_datetime(s.index).normalize(),
+        name: pd.to_numeric(s.values, errors="coerce")
+    }).dropna().sort_values("us_date")
+    m = pd.merge_asof(
+        left, right, left_on="jp_date", right_on="us_date",
+        direction="backward", allow_exact_matches=False
+    )
+    return pd.Series(m[name].values, index=left["jp_date"].values)
+
+@st.cache_data(ttl=3600)
 def build_research(start, end):
-    # The backtest deliberately uses only data that was already available
-    # by the Japanese cash-session close. US features are the PREVIOUS US
-    # session, never the same day's US close (look-ahead avoidance).
-    raw = {k: download_daily(v, start, end) for k, v in TICKERS.items()}
+    start_dt = pd.Timestamp(start) - pd.Timedelta(days=20)
+    end_dt = pd.Timestamp(end) + pd.Timedelta(days=3)
+    raw = {k: download_daily(v, start_dt.date().isoformat(), end_dt.date().isoformat())
+           for k, v in TICKERS.items()}
 
-    jp = pd.DataFrame(index=raw["1570"].index)
     etf = raw["1570"]
-    n225 = raw["日経225"]
-    topix = raw["TOPIX"]
+    if etf.empty:
+        return pd.DataFrame()
 
-    for c in ["Open", "High", "Low", "Close"]:
-        if c in etf.columns:
-            jp[f"etf_{c.lower()}"] = pd.to_numeric(etf[c], errors="coerce")
+    jp = pd.DataFrame(index=etf.index.copy())
+    jp.index.name = "date"
+    jp["etf_open"] = pd.to_numeric(etf["Open"], errors="coerce")
+    jp["etf_close"] = pd.to_numeric(etf["Close"], errors="coerce")
 
-    jp["n225_close"] = series_close(n225)
-    if not n225.empty:
-        jp["n225_prev_close"] = jp["n225_close"].shift(1)
-        jp["n225_ret"] = jp["n225_close"].pct_change() * 100
-        high = pd.to_numeric(n225.get("High"), errors="coerce")
-        low = pd.to_numeric(n225.get("Low"), errors="coerce")
-        jp["n225_close_pos"] = ((jp["n225_close"] - low) / (high - low)).replace([np.inf, -np.inf], np.nan)
+    # 日本市場情報（当日の大引けまでに既知）
+    n225 = raw["日経225"].reindex(jp.index)
+    topix = raw["TOPIX"].reindex(jp.index)
+    jp["n225_close"] = pd.to_numeric(n225.get("Close"), errors="coerce")
+    jp["n225_ret"] = jp["n225_close"].pct_change() * 100
+    hi = pd.to_numeric(n225.get("High"), errors="coerce")
+    lo = pd.to_numeric(n225.get("Low"), errors="coerce")
+    jp["n225_close_pos"] = ((jp["n225_close"] - lo) / (hi - lo)).replace([np.inf, -np.inf], np.nan)
+    jp["topix_ret"] = close_s(topix).reindex(jp.index).pct_change() * 100
 
-    jp["topix_ret"] = series_close(topix).pct_change() * 100
-
-    us_map = {
-        "nq_ret": "NASDAQ100", "sp_ret": "S&P500",
-        "sox_ret": "SOX", "dow_ret": "NYダウ"
+    # 米国市場情報：日本日付Dより前に終了した直近米国セッション
+    us_returns = {
+        "nq_ret": close_s(raw["NASDAQ100"]).pct_change() * 100,
+        "sp_ret": close_s(raw["S&P500"]).pct_change() * 100,
+        "sox_ret": close_s(raw["SOX"]).pct_change() * 100,
+        "dow_ret": close_s(raw["NYダウ"]).pct_change() * 100,
+        "usd_ret": close_s(raw["ドル円"]).pct_change() * 100,
+        "tnx_ret": close_s(raw["米10年金利"]).pct_change() * 100,
     }
-    for feat, key in us_map.items():
-        s = series_close(raw[key])
-        # shift(1): the last completed US session before Japanese date D.
-        jp[feat] = s.pct_change().shift(1) * 100
+    for feat, s in us_returns.items():
+        jp[feat] = map_prior_us_feature(jp.index, s, feat).reindex(jp.index).values
 
-    vix = series_close(raw["VIX"])
-    usd = series_close(raw["ドル円"])
-    tnx = series_close(raw["米10年金利"])
+    vix = close_s(raw["VIX"])
+    jp["vix_level"] = map_prior_us_feature(jp.index, vix, "vix_level").reindex(jp.index).values
 
-    jp["vix_level"] = vix.shift(1)
-    jp["usd_ret"] = usd.pct_change().shift(1) * 100
-    jp["tnx_ret"] = tnx.pct_change().shift(1) * 100
-
-    jp["us_breadth"] = sum([
-        (jp["nq_ret"] > 0).astype(int),
-        (jp["sp_ret"] > 0).astype(int),
-        (jp["sox_ret"] > 0).astype(int),
-        (jp["dow_ret"] > 0).astype(int),
-    ])
+    jp["us_breadth"] = (
+        (jp["nq_ret"] > 0).astype(int)
+        + (jp["sp_ret"] > 0).astype(int)
+        + (jp["sox_ret"] > 0).astype(int)
+        + (jp["dow_ret"] > 0).astype(int)
+    )
     jp["nq_usd_combo"] = jp["nq_ret"] + jp["usd_ret"]
 
-    # Target: buy 1570 at today's close, sell at next trading day's open.
-    jp["target_next_open_ret"] = (jp["etf_open"].shift(-1) / jp["etf_close"] - 1) * 100
+    # 目的変数：当日大引け買い → 翌営業日寄り売り
+    jp["next_open"] = jp["etf_open"].shift(-1)
+    jp["target_next_open_ret"] = (jp["next_open"] / jp["etf_close"] - 1) * 100
     jp["target_up"] = jp["target_next_open_ret"] > 0
 
-    return jp.dropna(subset=["etf_close", "etf_open", "target_next_open_ret"])
+    jp = jp[(jp.index >= pd.Timestamp(start)) & (jp.index <= pd.Timestamp(end))]
+    return jp.dropna(subset=["etf_close", "next_open", "target_next_open_ret"])
 
-def screen_features(df, min_n):
-    rows = []
-    for feat, label in FEATURE_LABELS.items():
-        if feat not in df.columns:
-            continue
-        s = df[feat].dropna()
-        if len(s) < min_n:
-            continue
-
-        for q, direction, symbol in [
-            (0.20, "low", "≤"),
-            (0.30, "low", "≤"),
-            (0.40, "low", "≤"),
-            (0.60, "high", "≥"),
-            (0.70, "high", "≥"),
-            (0.80, "high", "≥"),
-        ]:
-            threshold = s.quantile(q)
-            if direction == "low":
-                mask = df[feat] <= threshold
-            else:
-                mask = df[feat] >= threshold
-            x = df.loc[mask, "target_next_open_ret"].dropna()
-            if len(x) < min_n:
-                continue
-            mean_ret = x.mean()
-            up_rate = (x > 0).mean() * 100
-            rows.append({
-                "情報": label,
-                "条件": f"{symbol} {threshold:.3f}" + ("以下" if direction=="low" else "以上"),
-                "件数": len(x),
-                "上昇率": up_rate,
-                "平均リターン": mean_ret,
-                "中央値": x.median(),
-                "最大勝ち": x.max(),
-                "最大負け": x.min(),
-            })
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    out["スコア"] = out["平均リターン"] * np.sqrt(out["件数"])
-    return out.sort_values(["平均リターン", "上昇率"], ascending=False)
-
-def calc_stats(x):
+def stats(x):
     x = pd.Series(x).dropna()
-    if len(x) == 0:
-        return {}
+    if x.empty:
+        return {"n":0,"win":np.nan,"mean":np.nan,"median":np.nan,"pf":np.nan,"cum":np.nan}
     wins = x[x > 0]
     losses = x[x <= 0]
     pf = wins.sum() / abs(losses.sum()) if len(losses) and losses.sum() != 0 else np.nan
     return {
         "n": len(x),
-        "win_rate": (x > 0).mean() * 100,
+        "win": (x > 0).mean() * 100,
         "mean": x.mean(),
         "median": x.median(),
         "pf": pf,
         "cum": ((1 + x/100).prod() - 1) * 100,
     }
 
-st.title("🔬 翌朝寄り付き研究アプリ")
-st.caption("「前日15:25時点で何が翌朝の1570寄り付きに効くのか」を探すための研究用アプリです。")
-st.info("⚠️ 重要：バックテストは未来情報を使わない設計です。米国株は「その日本日の前に終了した米国セッション」を使用します。15:25時点の米国先物リアルタイム値を長期間バックテストするには、別の高頻度ヒストリカルデータが必要です。")
+def candidate_mask(df, feat, direction, threshold):
+    if direction == "low":
+        return df[feat] <= threshold
+    return df[feat] >= threshold
+
+def discover_candidates(train, valid, min_n):
+    base_tr = stats(train["target_next_open_ret"])
+    base_va = stats(valid["target_next_open_ret"])
+    rows = []
+
+    quantiles = [
+        (0.20, "low"), (0.30, "low"), (0.40, "low"),
+        (0.60, "high"), (0.70, "high"), (0.80, "high"),
+    ]
+
+    for feat, (label, _) in FEATURES.items():
+        s = train[feat].dropna()
+        if len(s) < min_n:
+            continue
+
+        for q, direction in quantiles:
+            threshold = s.quantile(q)
+            mtr = candidate_mask(train, feat, direction, threshold)
+            mva = candidate_mask(valid, feat, direction, threshold)
+
+            tr = stats(train.loc[mtr, "target_next_open_ret"])
+            va = stats(valid.loc[mva, "target_next_open_ret"])
+
+            if tr["n"] < min_n:
+                continue
+
+            symbol = "≤" if direction == "low" else "≥"
+            cond = f"{symbol} {threshold:.3f}"
+
+            train_edge = tr["mean"] - base_tr["mean"]
+            valid_edge = va["mean"] - base_va["mean"] if va["n"] else np.nan
+
+            if va["n"] >= max(20, min_n // 2) and train_edge > 0 and valid_edge > 0:
+                verdict = "🟢 再現候補"
+            elif train_edge > 0 and va["n"] >= max(20, min_n // 2):
+                verdict = "🟡 検証で再現せず"
+            else:
+                verdict = "⚪ 参考"
+
+            rows.append({
+                "feature": feat,
+                "情報": label,
+                "条件": cond,
+                "direction": direction,
+                "threshold": threshold,
+                "発見件数": tr["n"],
+                "発見上昇率": tr["win"],
+                "発見平均": tr["mean"],
+                "発見改善": train_edge,
+                "検証件数": va["n"],
+                "検証上昇率": va["win"],
+                "検証平均": va["mean"],
+                "検証改善": valid_edge,
+                "検証PF": va["pf"],
+                "判定": verdict,
+            })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out, base_tr, base_va
+
+    # 発見と検証の両方で基準超えした候補を優先
+    out["再現スコア"] = (
+        out["発見改善"].clip(lower=-9) +
+        out["検証改善"].fillna(-9).clip(lower=-9)
+    )
+    out = out.sort_values(
+        ["判定", "再現スコア", "検証平均", "発見平均"],
+        ascending=[True, False, False, False]
+    )
+    # 文字列順にならないよう独自順序で再ソート
+    rank = {"🟢 再現候補":0, "🟡 検証で再現せず":1, "⚪ 参考":2}
+    out["_rank"] = out["判定"].map(rank).fillna(9)
+    out = out.sort_values(["_rank","再現スコア"], ascending=[True,False]).drop(columns="_rank")
+    return out, base_tr, base_va
+
+def plain_explanation(row, base_tr, base_va):
+    feat = row["feature"]
+    direction_text = "以下" if row["direction"] == "low" else "以上"
+    label = row["情報"]
+    t = row["threshold"]
+    return (
+        f"**{label} が {t:.3f}{direction_text}**だった日を取り出した条件です。  \n"
+        f"発見期間では平均 {row['発見平均']:+.3f}%（無条件 {base_tr['mean']:+.3f}%）、"
+        f"検証期間では平均 {row['検証平均']:+.3f}%（無条件 {base_va['mean']:+.3f}%）でした。  \n"
+        f"{EXPLANATIONS.get(feat,'')}  \n"
+        f"**{row['判定']}**：これはまだ売買ルールではなく、Aアプリに入れる前の研究候補です。"
+    )
+
+# =========================================================
+# UI
+# =========================================================
+st.title("🔬 B_翌朝寄り付き研究アプリ")
+st.caption("『何が翌朝の1570に効くのか』を、発見期間と検証期間を分けて調べます。")
+
+st.info(
+    "このBアプリの目的は『一番良かった条件を見つける』ことではなく、"
+    "**過去の前半で見つけた条件が、後半の未使用データでも再現するか**を確認することです。"
+)
+
+today = datetime.now(JST).date()
 
 with st.sidebar:
     st.header("🔧 研究条件")
-    start_date = st.date_input("開始日", datetime(2018,1,1).date())
-    end_date = st.date_input("終了日", datetime.now(JST).date())
-    min_n = st.number_input("最低サンプル数", min_value=20, max_value=200, value=40, step=10)
-    run = st.button("🔄 研究データを取得", type="primary")
+    st.markdown("**① 条件を発見する期間**")
+    discover_start = st.date_input("発見開始", datetime(2018,1,1).date(), key="ds")
+    discover_end = st.date_input("発見終了", datetime(2023,12,31).date(), key="de")
 
-if run or "research_df" not in st.session_state:
-    with st.spinner("過去データを取得・整形しています…"):
+    st.markdown("**② 答え合わせする期間**")
+    validate_start = st.date_input("検証開始", datetime(2024,1,1).date(), key="vs")
+    validate_end = st.date_input("検証終了", today, key="ve")
+
+    min_n = st.number_input("発見期間の最低サンプル数", 20, 300, 80, 10)
+    run = st.button("🔄 研究を実行", type="primary")
+
+if discover_end >= validate_start:
+    st.warning("発見期間と検証期間が重なっています。検証期間は発見期間より後にしてください。")
+
+all_start = min(discover_start, validate_start)
+all_end = max(discover_end, validate_end)
+
+if run or "B02_df" not in st.session_state:
+    with st.spinner("研究データを取得・整理しています…"):
         try:
-            df = build_research(start_date.isoformat(), end_date.isoformat())
-            st.session_state["research_df"] = df
+            st.session_state["B02_df"] = build_research(all_start.isoformat(), all_end.isoformat())
         except Exception as e:
-            st.error(f"データ取得・計算でエラーが発生しました：{e}")
+            st.error(f"データ取得エラー：{e}")
             st.stop()
-else:
-    df = st.session_state["research_df"]
 
+df = st.session_state["B02_df"]
 if df.empty:
-    st.error("データが取得できませんでした。期間やYahoo Finance側の提供状況を確認してください。")
+    st.error("データが取得できませんでした。")
     st.stop()
 
-st.subheader("① まず全体像")
-stats = calc_stats(df["target_next_open_ret"])
-c = st.columns(5)
-c[0].metric("対象件数", f"{stats['n']:,}件")
-c[1].metric("翌朝上昇率", f"{stats['win_rate']:.1f}%")
-c[2].metric("平均寄り付きリターン", f"{stats['mean']:+.3f}%")
-c[3].metric("中央値", f"{stats['median']:+.3f}%")
-c[4].metric("複利", f"{stats['cum']:+.2f}%")
+train = df[(df.index >= pd.Timestamp(discover_start)) & (df.index <= pd.Timestamp(discover_end))].copy()
+valid = df[(df.index >= pd.Timestamp(validate_start)) & (df.index <= pd.Timestamp(validate_end))].copy()
 
-st.caption("対象は「1570を日本市場の終値で買い、次の営業日の寄り付きで売る」単純モデル。手数料・スリッページ・税金は未反映。")
+result, base_tr, base_va = discover_candidates(train, valid, int(min_n))
 
-st.subheader("② 何が効いている？")
-result = screen_features(df, int(min_n))
+# 1. やさしい全体像
+st.header("① まず、何を比べているの？")
+st.write(
+    "毎日無条件で1570を大引けに買って翌朝寄りで売った場合を**基準**にします。"
+    "その基準より『特定の条件の日だけ買う』ほうが良くなるかを調べています。"
+)
+
+c1, c2 = st.columns(2)
+with c1:
+    st.subheader("🔎 発見期間")
+    st.caption(f"{discover_start} ～ {discover_end}")
+    a = st.columns(3)
+    a[0].metric("件数", f"{base_tr['n']:,}")
+    a[1].metric("無条件の上昇率", f"{base_tr['win']:.1f}%")
+    a[2].metric("無条件の平均", f"{base_tr['mean']:+.3f}%")
+with c2:
+    st.subheader("✅ 検証期間")
+    st.caption(f"{validate_start} ～ {validate_end}")
+    a = st.columns(3)
+    a[0].metric("件数", f"{base_va['n']:,}")
+    a[1].metric("無条件の上昇率", f"{base_va['win']:.1f}%")
+    a[2].metric("無条件の平均", f"{base_va['mean']:+.3f}%")
+
+st.caption(
+    "例：検証期間の無条件平均が +0.10% なら、候補条件の検証平均が +0.25% なら『+0.15%改善』と見ます。"
+)
+
+# 2. 今日の研究で分かったこと
+st.header("② 今日の研究で分かったこと")
+
 if result.empty:
-    st.warning("条件を満たす分析結果がありません。最低サンプル数を下げてください。")
+    st.warning("候補がありません。期間または最低サンプル数を調整してください。")
 else:
-    display = result.copy()
-    for col in ["上昇率"]:
-        display[col] = display[col].map(lambda x: f"{x:.1f}%")
-    for col in ["平均リターン", "中央値", "最大勝ち", "最大負け"]:
-        display[col] = display[col].map(lambda x: f"{x:+.3f}%")
-    display["スコア"] = result["スコア"].map(lambda x: f"{x:+.3f}")
-    st.dataframe(display.head(30), use_container_width=True, hide_index=True)
+    reproducible = result[result["判定"] == "🟢 再現候補"].copy()
 
-    best = result.iloc[0]
-    st.success(f"現時点の上位候補：**{best['情報']} / {best['条件']}** → 件数 {int(best['件数'])}、上昇率 {best['上昇率']:.1f}%、平均リターン {best['平均リターン']:+.3f}%")
+    if reproducible.empty:
+        st.warning(
+            "今回は『発見期間で良く、検証期間でも基準より良かった』条件が見つかりませんでした。"
+            "これは失敗ではなく、過学習を避けるための重要な結果です。"
+        )
+    else:
+        top = reproducible.iloc[0]
+        st.success(
+            f"⭐ 最も注目する再現候補：**{top['情報']} / {top['条件']}**  "
+            f"｜検証 {int(top['検証件数'])}件・上昇率 {top['検証上昇率']:.1f}%・"
+            f"平均 {top['検証平均']:+.3f}%"
+        )
+        st.markdown(plain_explanation(top, base_tr, base_va))
 
-st.subheader("③ 候補条件を選んで詳しく見る")
-labels = [v for v in FEATURE_LABELS.values()]
-label_to_feat = {v:k for k,v in FEATURE_LABELS.items()}
-selected_label = st.selectbox("分析する情報", labels)
-feat = label_to_feat[selected_label]
-q = st.slider("条件の分位点", 0.05, 0.95, 0.70, 0.05)
-direction = st.radio("条件方向", ["以上", "以下"], horizontal=True)
-threshold = df[feat].quantile(q if direction=="以上" else 1-q)
-mask = df[feat] >= threshold if direction=="以上" else df[feat] <= threshold
-x = df.loc[mask, "target_next_open_ret"]
-s2 = calc_stats(x)
-if s2:
-    cc = st.columns(5)
-    cc[0].metric("条件該当数", f"{s2['n']:,}")
-    cc[1].metric("上昇率", f"{s2['win_rate']:.1f}%")
-    cc[2].metric("平均", f"{s2['mean']:+.3f}%")
-    cc[3].metric("中央値", f"{s2['median']:+.3f}%")
-    cc[4].metric("Profit Factor", f"{s2['pf']:.2f}" if np.isfinite(s2["pf"]) else "—")
-    st.write(f"**判定閾値：{threshold:.4f}**")
-    chart = pd.DataFrame({"翌朝1570寄り付きリターン": x.values})
-    st.line_chart(chart)
+        st.subheader("注目候補 TOP5")
+        for _, row in reproducible.head(5).iterrows():
+            with st.expander(
+                f"{row['情報']} / {row['条件']}  → 検証平均 {row['検証平均']:+.3f}% "
+                f"（改善 {row['検証改善']:+.3f}%）"
+            ):
+                st.markdown(plain_explanation(row, base_tr, base_va))
 
-st.subheader("④ 時系列で確認")
-st.line_chart(df.set_index(df.index)["target_next_open_ret"].rolling(20).mean())
+# 3. 比較表
+st.header("③ 発見期間と検証期間を並べて見る")
+st.write(
+    "ここがBアプリの中心です。**発見期間だけ良い条件は信用しません。検証期間でも同じ方向に改善するか**を見ます。"
+)
 
-st.subheader("⑤ 研究上の注意")
+if not result.empty:
+    show = result.copy()
+    cols = [
+        "判定","情報","条件",
+        "発見件数","発見上昇率","発見平均","発見改善",
+        "検証件数","検証上昇率","検証平均","検証改善","検証PF"
+    ]
+    show = show[cols].head(40)
+
+    for col in ["発見上昇率","検証上昇率"]:
+        show[col] = show[col].map(lambda x: "—" if pd.isna(x) else f"{x:.1f}%")
+    for col in ["発見平均","発見改善","検証平均","検証改善"]:
+        show[col] = show[col].map(lambda x: "—" if pd.isna(x) else f"{x:+.3f}%")
+    show["検証PF"] = show["検証PF"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+# 4. 表の読み方
+st.header("④ 表はこう読む")
 st.markdown("""
-- **相関と因果は別物**です。過去に効いたから将来も効くとは限りません。
-- 条件を何百通りも試して「一番良いもの」を選ぶと、過学習になりやすいです。
-- 本番採用前に、期間を分けた**アウト・オブ・サンプル検証**を行います。
-- まずは「何が効くか」を発見し、その後にAアプリの判定条件へ戻します。
-- 目標は勝率ではなく、**翌朝リターンの期待値が安定してプラスになる情報**を見つけることです。
+**🟢 再現候補**  
+発見期間で無条件より良く、さらに検証期間でも無条件より良かった条件です。  
+→ 次に詳しく調べる価値があります。
+
+**🟡 検証で再現せず**  
+発見期間では良かったのに、未使用の検証期間では基準を上回りませんでした。  
+→ 過去に偶然よく見えただけの可能性があります。
+
+**⚪ 参考**  
+現時点では優位性が弱い条件です。
+
+**「改善」**  
+その期間の無条件平均と比べて、条件を付けることで平均リターンが何%上がったかです。  
+ここを特に重視します。
 """)
 
-st.caption(f"最終更新表示：{datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')} JST")
+# 5. 個別候補を学ぶ
+st.header("⑤ 気になる候補を1つ選んで勉強する")
+if not result.empty:
+    options = [
+        f"{i+1}. {r['情報']} / {r['条件']} / {r['判定']}"
+        for i, (_, r) in enumerate(result.head(40).iterrows())
+    ]
+    selected = st.selectbox("候補", options)
+    idx = int(selected.split(".")[0]) - 1
+    row = result.head(40).iloc[idx]
+    st.markdown(plain_explanation(row, base_tr, base_va))
+
+    x1 = train.loc[candidate_mask(train, row["feature"], row["direction"], row["threshold"]), "target_next_open_ret"]
+    x2 = valid.loc[candidate_mask(valid, row["feature"], row["direction"], row["threshold"]), "target_next_open_ret"]
+
+    cc = st.columns(2)
+    with cc[0]:
+        st.subheader("発見期間")
+        st.metric("平均", f"{x1.mean():+.3f}%")
+        st.metric("上昇率", f"{(x1>0).mean()*100:.1f}%")
+    with cc[1]:
+        st.subheader("検証期間")
+        st.metric("平均", f"{x2.mean():+.3f}%" if len(x2) else "—")
+        st.metric("上昇率", f"{(x2>0).mean()*100:.1f}%" if len(x2) else "—")
+
+# 6. 次に何をするか
+st.header("⑥ 次に何をすればいい？")
+if not result.empty and not result[result["判定"] == "🟢 再現候補"].empty:
+    st.write(
+        "まず🟢再現候補を2〜3個に絞ります。次の版では、その候補を**2条件組み合わせても再現するか**を調べます。"
+        "それでも安定していれば、初めてAアプリへの採用候補にします。"
+    )
+else:
+    st.write(
+        "今回は強い再現候補がありません。条件の閾値を細かく探しすぎず、"
+        "次は特徴量そのもの（日経先物など）を追加する方が有効です。"
+    )
+
+st.warning(
+    "⚠️ 重要：Bアプリの結果だけで売買条件を変更しません。"
+    "『発見 → 未使用期間で検証 → 実運用でフォワード確認』の順で進めます。"
+)
+st.caption(f"最終更新：{datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')} JST")
