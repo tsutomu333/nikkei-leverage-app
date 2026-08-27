@@ -348,14 +348,19 @@ if st.button("🔄 バックテストを実行", type="secondary"):
             else:
                 cur = 0
 
-        m = st.columns(7)
-        m[0].metric("取引数", f"{len(r)}回")
-        m[1].metric("勝率", f"{win_rate:.1f}%")
-        m[2].metric("複利リターン", f"{total_return:+.2f}%")
-        m[3].metric("期待値/回", f"{avg:+.3f}%")
-        m[4].metric("平均勝ち", f"{avg_win:+.3f}%")
-        m[5].metric("平均負け", f"{avg_loss:+.3f}%")
-        m[6].metric("最大DD", f"{max_dd:.2f}%")
+        # 7項目を1列に詰めると、Streamlitの画面幅によって
+        # 「+0.001%」などが「+0.0...」と省略表示されるため、
+        # 4項目＋3項目の2段に分けて、数字を最後まで表示する。
+        m1 = st.columns(4)
+        m1[0].metric("取引数", f"{len(r)}回")
+        m1[1].metric("勝率", f"{win_rate:.1f}%")
+        m1[2].metric("複利リターン", f"{total_return:+.2f}%")
+        m1[3].metric("最大DD", f"{max_dd:.2f}%")
+
+        m2 = st.columns(3)
+        m2[0].metric("期待値 / 1回", f"{avg:+.3f}%")
+        m2[1].metric("平均勝ち", f"{avg_win:+.3f}%")
+        m2[2].metric("平均負け", f"{avg_loss:+.3f}%")
 
         st.caption(
             f"勝敗 {wins}勝 / {losses}敗 ｜ 利益率(Profit Factor) "
