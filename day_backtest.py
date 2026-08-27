@@ -1,121 +1,114 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
-import time
+import datetime
+from dateutil.relativedelta import relativedelta
 
-st.title("日中デイトレ戦略（安全フィルター ＋ 窓開け）検証ダッシュボード")
-st.write("VIX・ドル円の安全フィルターと、朝の強い窓開けを組み合わせたデイトレ戦略を検証します。")
+st.title("📊 日中デイトレ・バックテスト検証アプリ（NYダウ搭載版）")
+st.write("1570（日経レバ）の朝イチ寄り引け戦略を、過去データでシミュレーションします。")
 
-# --- 1. サイドバー：パラメータ調整 ---
-st.sidebar.header("⚙️ デイトレ戦略の条件設定")
-p_gap = st.sidebar.slider("③ 朝の窓開け基準値(%) ［厳しめ］", min_value=0.0, max_value=2.0, value=0.2, step=0.1)
-p_vix = st.sidebar.slider("VIX(恐怖指数)の上限", min_value=15.0, max_value=35.0, value=20.0, step=0.5)
-p_usd = st.sidebar.slider("ドル円の許容下落幅(%)", min_value=-2.0, max_value=0.0, value=-0.5, step=0.1)
+# --- 1. サイドバー：検証条件の設定 ---
+st.sidebar.header("⚙️ 検証ルールの設定")
+p_gap = st.sidebar.slider("③ 朝の窓開け基準値(%)", min_value=0.0, max_value=2.0, value=0.2, step=0.1)
+p_dow = st.sidebar.slider("④ 前日NYダウの基準値(%)", min_value=-2.0, max_value=2.0, value=0.0, step=0.1)
+p_vix = st.sidebar.slider("① VIX(恐怖指数)の上限", min_value=15.0, max_value=35.0, value=20.0, step=0.5)
+p_usd = st.sidebar.slider("② ドル円の許容下落幅(%)", min_value=-2.0, max_value=0.0, value=-0.5, step=0.1)
 
-# 期間設定
-years = list(range(2018, datetime.now().year + 1))
-months = list(range(1, 13))
+st.sidebar.markdown("---")
+years = st.sidebar.slider("検証期間（過去何年分？）", min_value=1, max_value=10, value=3)
 
-col_y1, col_m1 = st.sidebar.columns(2)
-start_year = col_y1.selectbox("開始 年", years, index=len(years)-2)
-start_month = col_m1.selectbox("開始 月", months, index=8)
-
-col_y2, col_m2 = st.sidebar.columns(2)
-end_year = col_y2.selectbox("終了 年", years, index=len(years)-1)
-end_month = col_m2.selectbox("終了 月", months, index=datetime.now().month-1)
-
-start_date = f"{start_year}-{start_month:02d}-01"
-if end_month == 12:
-    end_date = f"{end_year+1}-01-01"
-else:
-    end_date = f"{end_year}-{end_month+1:02d}-01"
-
-# --- 2. データの取得 ---
+# --- 2. 過去データの取得 ---
 @st.cache_data(ttl=3600)
-def load_day_data():
-    t_vix = yf.download("^VIX", period="5y", progress=False)
-    time.sleep(1)
-    t_usd = yf.download("USDJPY=X", period="5y", progress=False)
-    time.sleep(1)
-    t_n225 = yf.download("^N225", period="5y", progress=False)
-
-    for df in [t_vix, t_usd, t_n225]:
+def load_historical_data(years):
+    end_date = datetime.date.today()
+    start_date = end_date - relativedelta(years=years)
+    
+    # 現物1570、VIX、ドル円、NYダウを取得
+    t_1570 = yf.download("1570.T", start=start_date, end=end_date, progress=False)
+    t_vix = yf.download("^VIX", start=start_date, end=end_date, progress=False)
+    t_usd = yf.download("USDJPY=X", start=start_date, end=end_date, progress=False)
+    t_dow = yf.download("^DJI", start=start_date, end=end_date, progress=False)
+    
+    # マルチインデックスの解除（yfinanceの仕様変更対応）
+    for df in [t_1570, t_vix, t_usd, t_dow]:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        df.index = df.index.tz_localize(None)
+        df.index = df.index.tz_localize(None).normalize()
+        
+    return t_1570, t_vix, t_usd, t_dow
 
-    df = pd.DataFrame({
-        'VIX_Close': t_vix['Close'],
-        'USD_Close': t_usd['Close'],
-        'N225_Open': t_n225['Open'],
-        'N225_High': t_n225['High'],
-        'N225_Low': t_n225['Low'],
-        'N225_Close': t_n225['Close']
-    }).dropna()
+with st.spinner(f"過去{years}年分の市場データを取得・統合中..."):
+    t_1570, t_vix, t_usd, t_dow = load_historical_data(years)
 
-    df['USD_pct'] = df['USD_Close'].pct_change() * 100
-    df['Intraday_Return'] = (df['N225_Close'] - df['N225_Open']) / df['N225_Open'] * 100
-    df['Gap_Open'] = (df['N225_Open'] - df['N225_Close'].shift(1)) / df['N225_Close'].shift(1) * 100
-    
-    return df.dropna()
+# --- 3. データの結合とズレ（Look-ahead bias）の排除 ---
+# 日本市場（1570）のカレンダーをベースにする
+df = t_1570[['Open', 'Close']].copy()
 
-with st.spinner("データを安全に取得してシミュレーション中..."):
-    df_all = load_day_data()
+# 各種指標を日付で結合（左結合）
+df = df.join(t_vix[['Close']].rename(columns={'Close': 'VIX'}), how='left')
+df = df.join(t_usd[['Close']].rename(columns={'Close': 'USD'}), how='left')
+df = df.join(t_dow[['Close']].rename(columns={'Close': 'DOW'}), how='left')
 
-mask = (df_all.index >= start_date) & (df_all.index < end_date)
-df = df_all.loc[mask].copy()
+# 休日などで欠損したデータは前日の値で埋める
+df = df.ffill()
 
-if len(df) == 0:
-    st.error("指定された期間のデータがありません。")
-    st.stop()
+# ⚠️最重要：当日の朝9時時点で参照できるのは「前日」のデータのみ。すべて1日（shift）ズラす。
+df['VIX_Prev'] = df['VIX'].shift(1)
+df['USD_Prev'] = df['USD'].shift(1)
+df['USD_Prev2'] = df['USD'].shift(2)
+df['DOW_Prev'] = df['DOW'].shift(1)
+df['DOW_Prev2'] = df['DOW'].shift(2)
 
-# --- 3. 判定ロジックとドローダウン計算 ---
-df['Cond_VIX'] = df['VIX_Close'] < p_vix
-df['Cond_USD'] = df['USD_pct'] > p_usd
-df['Cond_Gap'] = df['Gap_Open'] >= p_gap
+# 各種パーセンテージの計算
+df['1570_PrevClose'] = df['Close'].shift(1)
+df['Gap_Pct'] = (df['Open'] - df['1570_PrevClose']) / df['1570_PrevClose'] * 100
+df['Dow_Pct'] = (df['DOW_Prev'] - df['DOW_Prev2']) / df['DOW_Prev2'] * 100
+df['USD_Pct'] = (df['USD_Prev'] - df['USD_Prev2']) / df['USD_Prev2'] * 100
 
-df['Signal'] = df['Cond_VIX'] & df['Cond_USD'] & df['Cond_Gap']
+# 1570の日中リターン（朝買って、引けで売った場合の利益率）
+df['Daily_Return'] = (df['Close'] - df['Open']) / df['Open'] * 100
 
-trades = df[df['Signal']].copy()
-win_trades = trades[trades['Intraday_Return'] > 0]
+# 不要なNaNを削除（最初の数日分）
+df = df.dropna()
 
-total_trades = len(trades)
-win_count = len(win_trades)
-lose_count = total_trades - win_count
-win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0
-total_return = trades['Intraday_Return'].sum()
+# --- 4. トレードの判定（フィルター適用） ---
+cond_gap = df['Gap_Pct'] >= p_gap
+cond_dow = df['Dow_Pct'] >= p_dow
+cond_vix = df['VIX_Prev'] < p_vix
+cond_usd = df['USD_Pct'] > p_usd
 
-# 最大ドローダウン（MDD）の計算
-if total_trades > 0:
-    trades['Cumulative_Return'] = trades['Intraday_Return'].cumsum()
-    # 累積の最高値（ピーク）からの下落幅を計算
-    running_max = trades['Cumulative_Return'].cummax()
-    drawdown = trades['Cumulative_Return'] - running_max
-    max_drawdown = drawdown.min() # 最も大きく落ち込んだ値（マイナス）
-else:
-    max_drawdown = 0.0
+# 全条件をクリアした日（True/False）
+df['Trade_Signal'] = cond_gap & cond_dow & cond_vix & cond_usd
 
-# --- 4. 結果表示 ---
-st.header(f"📊 デイトレ検証結果 （期間: {start_year}年{start_month}月 〜 {end_year}年{end_month}月）")
+# トレードした日のデータだけを抽出
+trades = df[df['Trade_Signal']].copy()
 
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("総トレード", f"{total_trades} 回")
-col2.metric("勝率", f"{win_rate:.1f}%" if total_trades > 0 else "0%")
-col3.metric("勝敗", f"{win_count}勝/{lose_count}敗")
-col4.metric("累積リターン", f"{total_return:+.2f}%")
-col5.metric("最大DD", f"{max_drawdown:.2f}%") # 最大ドローダウン表示
-
+# --- 5. 検証結果の表示 ---
 st.markdown("---")
+st.subheader("🎯 バックテスト検証結果")
 
-if total_trades > 0:
-    st.subheader("📈 日中戦略の資産推移グラフ")
+if len(trades) > 0:
+    # 勝敗の計算
+    trades['Win'] = trades['Daily_Return'] > 0
+    win_rate = trades['Win'].mean() * 100
+    avg_return = trades['Daily_Return'].mean()
+    total_return = trades['Daily_Return'].sum()
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("総トレード回数", f"{len(trades)} 回")
+    col2.metric("勝率", f"{win_rate:.1f} %")
+    col3.metric("1回あたりの平均利益", f"{avg_return:+.2f} %")
+    col4.metric("累積リターン(単利)", f"{total_return:+.2f} %")
+    
+    st.markdown("### 📈 資産推移シミュレーション（累積リターン）")
+    # 資産の推移グラフを描画
+    trades['Cumulative_Return'] = trades['Daily_Return'].cumsum()
     st.line_chart(trades['Cumulative_Return'])
-else:
-    st.warning("条件に一致するトレードがありませんでした。基準（スライダー）を少し緩めてみてください。")
+    
+    st.markdown("### 📝 直近のトレード履歴")
+    # 見やすいように列を絞って直近10件を表示
+    display_cols = ['Gap_Pct', 'Dow_Pct', 'VIX_Prev', 'USD_Pct', 'Daily_Return']
+    st.dataframe(trades[display_cols].tail(10).style.format("{:.2f}"))
 
-st.subheader("📋 トレード履歴（日中）")
-if total_trades > 0:
-    display_df = trades[['Gap_Open', 'USD_pct', 'VIX_Close', 'Intraday_Return']].copy()
-    display_df.columns = [f'朝の窓開け(基準:{p_gap}%)', 'ドル円前日比(%)', 'VIX値', '日中リターン(9時→15時)(%)']
-    st.dataframe(display_df.sort_index(ascending=False))
+else:
+    st.warning("⚠️ 指定された条件が厳しすぎます。過去のデータで1回もトレード条件を満たしませんでした。スライダーを調整してください。")
