@@ -125,7 +125,8 @@ def download_daily(ticker, start, end):
 
 @st.cache_data(ttl=3600)
 def download_weather_daily(start, end):
-    """東京の日次気象データ（Open-Meteo歴史データAPI）。取得失敗時は空のDataFrameを返す。"""
+    """東京の日次気象データ（Open-Meteo歴史データAPI）。取得失敗時は空のDataFrameとデバッグ情報を返す。"""
+    debug = {"ok": False, "status": None, "error": None, "keys": None, "rows": 0}
     try:
         url = "https://archive-api.open-meteo.com/v1/archive"
         params = {
@@ -137,22 +138,30 @@ def download_weather_daily(start, end):
             "timezone": "Asia/Tokyo",
         }
         r = requests.get(url, params=params, timeout=25)
+        debug["status"] = r.status_code
         if r.status_code != 200:
-            return pd.DataFrame()
+            debug["error"] = f"HTTP {r.status_code}: {r.text[:300]}"
+            return pd.DataFrame(), debug
         js = r.json()
+        debug["keys"] = list(js.keys())
         d = js.get("daily", {})
         if "time" not in d:
-            return pd.DataFrame()
+            debug["error"] = f"'daily.time'が見つかりません。daily keys={list(d.keys())} / top keys={list(js.keys())}"
+            return pd.DataFrame(), debug
         df = pd.DataFrame(d)
         df["date"] = pd.to_datetime(df["time"]).dt.normalize()
         df = df.set_index("date")
-        return df
-    except Exception:
-        return pd.DataFrame()
+        debug["ok"] = True
+        debug["rows"] = len(df)
+        return df, debug
+    except Exception as e:
+        debug["error"] = f"{type(e).__name__}: {e}"
+        return pd.DataFrame(), debug
 
 @st.cache_data(ttl=3600)
 def download_weather_hourly(start, end):
-    """東京の時間別気象データ（Open-Meteo歴史データAPI）。取得失敗時は空のDataFrameを返す。"""
+    """東京の時間別気象データ（Open-Meteo歴史データAPI）。取得失敗時は空のDataFrameとデバッグ情報を返す。"""
+    debug = {"ok": False, "status": None, "error": None, "keys": None, "rows": 0}
     try:
         url = "https://archive-api.open-meteo.com/v1/archive"
         params = {
@@ -164,19 +173,26 @@ def download_weather_hourly(start, end):
             "timezone": "Asia/Tokyo",
         }
         r = requests.get(url, params=params, timeout=30)
+        debug["status"] = r.status_code
         if r.status_code != 200:
-            return pd.DataFrame()
+            debug["error"] = f"HTTP {r.status_code}: {r.text[:300]}"
+            return pd.DataFrame(), debug
         js = r.json()
+        debug["keys"] = list(js.keys())
         h = js.get("hourly", {})
         if "time" not in h:
-            return pd.DataFrame()
+            debug["error"] = f"'hourly.time'が見つかりません。hourly keys={list(h.keys())} / top keys={list(js.keys())}"
+            return pd.DataFrame(), debug
         df = pd.DataFrame(h)
         df["datetime"] = pd.to_datetime(df["time"])
         df["date"] = df["datetime"].dt.normalize()
         df["hour"] = df["datetime"].dt.hour
-        return df
-    except Exception:
-        return pd.DataFrame()
+        debug["ok"] = True
+        debug["rows"] = len(df)
+        return df, debug
+    except Exception as e:
+        debug["error"] = f"{type(e).__name__}: {e}"
+        return pd.DataFrame(), debug
 
 def close_s(df):
     if df.empty or "Close" not in df.columns:
@@ -299,7 +315,7 @@ def build_research(start, end):
     jp["vix_shock"] = jp["vix_ret"].abs()
 
     # --- ここから「天気」指標（Open-Meteo歴史データAPI、株価データとは別ソース） ---
-    weather_daily = download_weather_daily(start_dt.date().isoformat(), end_dt.date().isoformat())
+    weather_daily, wd_debug = download_weather_daily(start_dt.date().isoformat(), end_dt.date().isoformat())
     if not weather_daily.empty and "sunshine_duration" in weather_daily.columns:
         sunshine_min = pd.to_numeric(weather_daily["sunshine_duration"], errors="coerce") / 60.0
         jp["prev_sunshine_min"] = map_prior_us_feature(jp.index, sunshine_min.dropna(), "prev_sunshine_min").reindex(jp.index).values
@@ -316,7 +332,7 @@ def build_research(start, end):
     else:
         jp["prev_temp_max"] = np.nan
 
-    weather_hourly = download_weather_hourly(start_dt.date().isoformat(), end_dt.date().isoformat())
+    weather_hourly, wh_debug = download_weather_hourly(start_dt.date().isoformat(), end_dt.date().isoformat())
     if not weather_hourly.empty and "hour" in weather_hourly.columns:
         morning = weather_hourly[(weather_hourly["hour"] >= 6) & (weather_hourly["hour"] < 9)]
         if "precipitation" in morning.columns and not morning.empty:
@@ -337,7 +353,9 @@ def build_research(start, end):
 
     jp = jp[(jp.index >= pd.Timestamp(start)) & (jp.index <= pd.Timestamp(end))]
     needed = ["etf_open", "etf_close", "gap_pct", "day_ret", "vix_level", "usd_ret", "dow_ret"]
-    return jp.dropna(subset=needed)
+    result = jp.dropna(subset=needed)
+    result.attrs["weather_debug"] = {"daily": wd_debug, "hourly": wh_debug}
+    return result
 
 def norm_ppf(p):
     a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
@@ -645,6 +663,12 @@ wc = st.columns(len(weather_cols))
 for i, col in enumerate(weather_cols):
     non_na = df[col].notna().mean() * 100 if col in df.columns else 0.0
     wc[i].metric(FEATURES[col][0], f"{non_na:.0f}% 取得")
+
+wdebug = df.attrs.get("weather_debug")
+if wdebug:
+    any_fail = (not wdebug.get("daily", {}).get("ok")) or (not wdebug.get("hourly", {}).get("ok"))
+    with st.expander("天気データ取得の診断情報" + ("（失敗あり）" if any_fail else "（成功）"), expanded=any_fail):
+        st.json(wdebug)
 
 # =========================================================
 # ② 単一条件の発見・検証（天気を含む26特徴量）
