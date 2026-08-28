@@ -315,7 +315,10 @@ def build_research(start, end):
     jp["vix_shock"] = jp["vix_ret"].abs()
 
     # --- ここから「天気」指標（Open-Meteo歴史データAPI、株価データとは別ソース） ---
-    weather_daily, wd_debug = download_weather_daily(start_dt.date().isoformat(), end_dt.date().isoformat())
+    # Open-Meteo歴史データAPIは未来日付を受け付けない（今日まで）。株価用のend_dt（+3日バッファ）を
+    # そのまま渡すとHTTP 400になるため、天気APIへは「今日」を上限にキャップした日付を渡す。
+    weather_end_dt = min(end_dt, pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize())
+    weather_daily, wd_debug = download_weather_daily(start_dt.date().isoformat(), weather_end_dt.date().isoformat())
     if not weather_daily.empty and "sunshine_duration" in weather_daily.columns:
         sunshine_min = pd.to_numeric(weather_daily["sunshine_duration"], errors="coerce") / 60.0
         jp["prev_sunshine_min"] = map_prior_us_feature(jp.index, sunshine_min.dropna(), "prev_sunshine_min").reindex(jp.index).values
@@ -332,7 +335,7 @@ def build_research(start, end):
     else:
         jp["prev_temp_max"] = np.nan
 
-    weather_hourly, wh_debug = download_weather_hourly(start_dt.date().isoformat(), end_dt.date().isoformat())
+    weather_hourly, wh_debug = download_weather_hourly(start_dt.date().isoformat(), weather_end_dt.date().isoformat())
     if not weather_hourly.empty and "hour" in weather_hourly.columns:
         morning = weather_hourly[(weather_hourly["hour"] >= 6) & (weather_hourly["hour"] < 9)]
         if "precipitation" in morning.columns and not morning.empty:
