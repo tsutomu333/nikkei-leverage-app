@@ -2,6 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+from scipy import stats as scipy_stats
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -22,9 +23,9 @@ TICKERS = {
 }
 
 FEATURES = {
-    "n225_ret": ("前日日経225騰落率", "日経225"),
-    "n225_close_pos": ("前日日経225終値位置", "日経225"),
-    "topix_ret": ("前日TOPIX騰落率", "TOPIX"),
+    "n225_ret": ("当日日経225騰落率", "日経225"),
+    "n225_close_pos": ("当日日経225終値位置", "日経225"),
+    "topix_ret": ("当日TOPIX騰落率", "TOPIX"),
     "nq_ret": ("前回米国NASDAQ100騰落率", "NASDAQ100"),
     "sp_ret": ("前回米国S&P500騰落率", "S&P500"),
     "sox_ret": ("前回米国SOX騰落率", "SOX"),
@@ -37,9 +38,9 @@ FEATURES = {
 }
 
 EXPLANATIONS = {
-    "n225_ret": "日本市場そのものの前日騰落です。大きく下げた後に翌朝反発しやすいか、逆に上昇の勢いが続きやすいかを見ます。",
-    "n225_close_pos": "その日の高値〜安値のどこで日経225が引けたかです。1に近いほど高値圏、0に近いほど安値圏で引けています。",
-    "topix_ret": "日経225より広い日本株全体の動きです。日本市場全体の強弱が翌朝に残るかを見ます。",
+    "n225_ret": "エントリー当日（1570を大引けで買う日）の日経225騰落です。大きく下げた後に翌朝反発しやすいか、逆に上昇の勢いが続きやすいかを見ます。",
+    "n225_close_pos": "エントリー当日の高値〜安値のどこで日経225が引けたかです。1に近いほど高値圏、0に近いほど安値圏で引けています。",
+    "topix_ret": "日経225より広い日本株全体の、エントリー当日の動きです。日本市場全体の強弱が翌朝に残るかを見ます。",
     "nq_ret": "直前に終了した米国NASDAQ100の騰落です。日本のハイテク・半導体株に波及しやすい情報です。",
     "sp_ret": "直前のS&P500です。米国株全体のリスクオン・リスクオフを表す代表的な情報です。",
     "sox_ret": "米国半導体株の動きです。日経平均への寄与が大きい日本の半導体株との関連を調べます。",
@@ -142,7 +143,7 @@ def build_research(start, end):
 def stats(x):
     x = pd.Series(x).dropna()
     if x.empty:
-        return {"n":0,"win":np.nan,"mean":np.nan,"median":np.nan,"pf":np.nan,"cum":np.nan}
+        return {"n":0,"win":np.nan,"mean":np.nan,"median":np.nan,"std":np.nan,"pf":np.nan,"cum":np.nan}
     wins = x[x > 0]
     losses = x[x <= 0]
     pf = wins.sum() / abs(losses.sum()) if len(losses) and losses.sum() != 0 else np.nan
@@ -151,31 +152,54 @@ def stats(x):
         "win": (x > 0).mean() * 100,
         "mean": x.mean(),
         "median": x.median(),
+        "std": x.std(ddof=1) if len(x) > 1 else np.nan,
         "pf": pf,
         "cum": ((1 + x/100).prod() - 1) * 100,
     }
+
+def welch_t(mean1, std1, n1, mean2, std2, n2):
+    """条件付き部分集合の平均 と 全体（無条件）平均 を比較するWelchのt統計量。
+    部分集合は全体に内包される（独立でない）ため厳密な検定ではないが、
+    『改善幅がサンプルの散らばりに対してどれだけ大きいか』を測る目安として使う。"""
+    if any(pd.isna(v) for v in [mean1, std1, n1, mean2, std2, n2]) or n1 < 2 or n2 < 2:
+        return np.nan
+    se = np.sqrt((std1**2)/n1 + (std2**2)/n2)
+    if se == 0 or np.isnan(se):
+        return np.nan
+    return (mean1 - mean2) / se
 
 def candidate_mask(df, feat, direction, threshold):
     if direction == "low":
         return df[feat] <= threshold
     return df[feat] >= threshold
 
-def discover_candidates(train, valid, min_n):
+QUANTILES = [
+    (0.20, "low"), (0.30, "low"), (0.40, "low"),
+    (0.60, "high"), (0.70, "high"), (0.80, "high"),
+]
+
+def bonferroni_z(n_tests, alpha=0.05):
+    """72条件（特徴量×分位点）を同時に検定するため、有意水準をBonferroni補正する。
+    補正後のalphaに対応する両側z臨界値を返す。"""
+    n_tests = max(int(n_tests), 1)
+    adj_alpha = alpha / n_tests
+    return float(scipy_stats.norm.ppf(1 - adj_alpha / 2))
+
+def discover_candidates(train, valid, min_n, use_correction=True):
     base_tr = stats(train["target_next_open_ret"])
     base_va = stats(valid["target_next_open_ret"])
     rows = []
 
-    quantiles = [
-        (0.20, "low"), (0.30, "low"), (0.40, "low"),
-        (0.60, "high"), (0.70, "high"), (0.80, "high"),
-    ]
+    total_tests = len(FEATURES) * len(QUANTILES)
+    z_crit = bonferroni_z(total_tests) if use_correction else 1.0
+    valid_min_n = max(30, min_n // 2)
 
     for feat, (label, _) in FEATURES.items():
         s = train[feat].dropna()
         if len(s) < min_n:
             continue
 
-        for q, direction in quantiles:
+        for q, direction in QUANTILES:
             threshold = s.quantile(q)
             mtr = candidate_mask(train, feat, direction, threshold)
             mva = candidate_mask(valid, feat, direction, threshold)
@@ -192,9 +216,19 @@ def discover_candidates(train, valid, min_n):
             train_edge = tr["mean"] - base_tr["mean"]
             valid_edge = va["mean"] - base_va["mean"] if va["n"] else np.nan
 
-            if va["n"] >= max(20, min_n // 2) and train_edge > 0 and valid_edge > 0:
+            # 検証期間の条件付き平均が「無条件平均」から統計的にどれだけ離れているか。
+            # 72条件を同時に見ているため、単に valid_edge > 0 だけでは偶然一致が混ざりやすい。
+            # Bonferroni補正したz臨界値を超えるものだけを厳しく「再現」とみなす。
+            t_valid = welch_t(va["mean"], va["std"], va["n"], base_va["mean"], base_va["std"], base_va["n"])
+            significant = (not np.isnan(t_valid)) and abs(t_valid) >= z_crit
+
+            enough_n = va["n"] >= valid_min_n
+
+            if enough_n and train_edge > 0 and valid_edge > 0 and significant:
                 verdict = "🟢 再現候補"
-            elif train_edge > 0 and va["n"] >= max(20, min_n // 2):
+            elif enough_n and train_edge > 0 and valid_edge > 0:
+                verdict = "🟡 改善はあるが有意性不足"
+            elif train_edge > 0 and enough_n:
                 verdict = "🟡 検証で再現せず"
             else:
                 verdict = "⚪ 参考"
@@ -214,12 +248,13 @@ def discover_candidates(train, valid, min_n):
                 "検証平均": va["mean"],
                 "検証改善": valid_edge,
                 "検証PF": va["pf"],
+                "検証t値": t_valid,
                 "判定": verdict,
             })
 
     out = pd.DataFrame(rows)
     if out.empty:
-        return out, base_tr, base_va
+        return out, base_tr, base_va, total_tests, z_crit
 
     # 発見と検証の両方で基準超えした候補を優先
     out["再現スコア"] = (
@@ -231,10 +266,10 @@ def discover_candidates(train, valid, min_n):
         ascending=[True, False, False, False]
     )
     # 文字列順にならないよう独自順序で再ソート
-    rank = {"🟢 再現候補":0, "🟡 検証で再現せず":1, "⚪ 参考":2}
+    rank = {"🟢 再現候補":0, "🟡 改善はあるが有意性不足":1, "🟡 検証で再現せず":2, "⚪ 参考":3}
     out["_rank"] = out["判定"].map(rank).fillna(9)
     out = out.sort_values(["_rank","再現スコア"], ascending=[True,False]).drop(columns="_rank")
-    return out, base_tr, base_va
+    return out, base_tr, base_va, total_tests, z_crit
 
 def plain_explanation(row, base_tr, base_va):
     feat = row["feature"]
@@ -273,10 +308,21 @@ with st.sidebar:
     validate_end = st.date_input("検証終了", today, key="ve")
 
     min_n = st.number_input("発見期間の最低サンプル数", 20, 300, 80, 10)
+
+    st.markdown("**③ 判定の厳しさ**")
+    use_correction = st.checkbox(
+        "多重検定を補正する（Bonferroni・推奨）", value=True,
+        help="72個の条件（特徴量×分位点）を同時に試すため、補正しないと偶然良く見える条件が"
+             "🟢再現候補に紛れ込みやすくなります。オフにすると単純に「両期間で改善>0」だけで判定します。"
+    )
     run = st.button("🔄 研究を実行", type="primary")
 
 if discover_end >= validate_start:
-    st.warning("発見期間と検証期間が重なっています。検証期間は発見期間より後にしてください。")
+    st.error(
+        "発見期間と検証期間が重なっています（または順序が逆です）。"
+        "検証期間は発見期間より後の日付にしてください。"
+    )
+    st.stop()
 
 all_start = min(discover_start, validate_start)
 all_end = max(discover_end, validate_end)
@@ -297,7 +343,16 @@ if df.empty:
 train = df[(df.index >= pd.Timestamp(discover_start)) & (df.index <= pd.Timestamp(discover_end))].copy()
 valid = df[(df.index >= pd.Timestamp(validate_start)) & (df.index <= pd.Timestamp(validate_end))].copy()
 
-result, base_tr, base_va = discover_candidates(train, valid, int(min_n))
+result, base_tr, base_va, total_tests, z_crit = discover_candidates(
+    train, valid, int(min_n), use_correction=use_correction
+)
+
+if use_correction:
+    st.caption(
+        f"🧪 多重検定補正：今回は {total_tests} 個の条件を同時に試すため、"
+        f"検証期間での改善は目安として概ね z ≥ {z_crit:.2f} 相当（Bonferroni補正後の有意水準）"
+        "を満たすものだけを🟢再現候補としています。"
+    )
 
 # 1. やさしい全体像
 st.header("① まず、何を比べているの？")
@@ -367,7 +422,7 @@ if not result.empty:
     cols = [
         "判定","情報","条件",
         "発見件数","発見上昇率","発見平均","発見改善",
-        "検証件数","検証上昇率","検証平均","検証改善","検証PF"
+        "検証件数","検証上昇率","検証平均","検証改善","検証PF","検証t値"
     ]
     show = show[cols].head(40)
 
@@ -376,14 +431,20 @@ if not result.empty:
     for col in ["発見平均","発見改善","検証平均","検証改善"]:
         show[col] = show[col].map(lambda x: "—" if pd.isna(x) else f"{x:+.3f}%")
     show["検証PF"] = show["検証PF"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+    show["検証t値"] = show["検証t値"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
     st.dataframe(show, use_container_width=True, hide_index=True)
 
 # 4. 表の読み方
 st.header("④ 表はこう読む")
 st.markdown("""
 **🟢 再現候補**  
-発見期間で無条件より良く、さらに検証期間でも無条件より良かった条件です。  
+発見期間で無条件より良く、検証期間でも無条件より良く、
+かつ多重検定補正後の基準でも統計的に意味のある差でした。  
 → 次に詳しく調べる価値があります。
+
+**🟡 改善はあるが有意性不足**  
+両期間で改善はプラスですが、条件の数（72通り）を考慮すると偶然の範囲内かもしれません。  
+→ 参考にはなりますが、単独では採用根拠として弱いです。
 
 **🟡 検証で再現せず**  
 発見期間では良かったのに、未使用の検証期間では基準を上回りませんでした。  
@@ -395,6 +456,10 @@ st.markdown("""
 **「改善」**  
 その期間の無条件平均と比べて、条件を付けることで平均リターンが何%上がったかです。  
 ここを特に重視します。
+
+**「検証t値」**  
+検証期間の条件付き平均が、無条件平均からサンプルのばらつきに対してどれだけ離れているかの目安です。  
+絶対値が大きいほど「偶然とは考えにくい差」であることを示します（厳密な独立検定ではなく目安）。
 """)
 
 # 5. 個別候補を学ぶ
