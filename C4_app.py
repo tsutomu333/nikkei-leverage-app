@@ -315,9 +315,10 @@ def build_research(start, end):
     jp["vix_shock"] = jp["vix_ret"].abs()
 
     # --- ここから「天気」指標（Open-Meteo歴史データAPI、株価データとは別ソース） ---
-    # Open-Meteo歴史データAPIは未来日付を受け付けない（今日まで）。株価用のend_dt（+3日バッファ）を
-    # そのまま渡すとHTTP 400になるため、天気APIへは「今日」を上限にキャップした日付を渡す。
-    weather_end_dt = min(end_dt, pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None).normalize())
+    # Open-Meteo歴史データAPIは未来日付を受け付けない（UTC基準の「今日」まで、実際にはさらに
+    # 1日程度のデータ反映ラグがある）。株価用のend_dt（+3日バッファ）をそのまま渡すとHTTP 400に
+    # なるため、天気APIへはUTC基準の日付から安全マージン1日を引いた日付を上限として渡す。
+    weather_end_dt = min(end_dt, pd.Timestamp.utcnow().tz_localize(None).normalize() - pd.Timedelta(days=1))
     weather_daily, wd_debug = download_weather_daily(start_dt.date().isoformat(), weather_end_dt.date().isoformat())
     if not weather_daily.empty and "sunshine_duration" in weather_daily.columns:
         sunshine_min = pd.to_numeric(weather_daily["sunshine_duration"], errors="coerce") / 60.0
