@@ -2,6 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import itertools
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -298,6 +299,77 @@ def discover_candidates(train, valid, min_n, use_correction=True):
     out = out.sort_values(["_rank","再現スコア"], ascending=[True,False]).drop(columns="_rank")
     return out, base_tr, base_va, total_tests, z_crit
 
+def combo_mask(df, cand):
+    return candidate_mask(df, cand["feature"], cand["direction"], cand["threshold"])
+
+def combo_analyze(train, valid, base_tr, base_va, candidates, min_n_combo, use_correction=True):
+    """選ばれた候補どうしの2条件組み合わせ（AND）を、単一条件と同じ考え方で検証する。
+    同じ特徴量どうしの組み合わせは（片方が他方に包含され実質的に意味が薄いため）除外する。"""
+    pairs = [
+        (c1, c2) for c1, c2 in itertools.combinations(candidates, 2)
+        if c1["feature"] != c2["feature"]
+    ]
+    if not pairs:
+        return pd.DataFrame(), 0, 1.0
+
+    total_tests = len(pairs)
+    z_crit = bonferroni_z(total_tests) if use_correction else 1.0
+
+    rows = []
+    for c1, c2 in pairs:
+        mtr = combo_mask(train, c1) & combo_mask(train, c2)
+        mva = combo_mask(valid, c1) & combo_mask(valid, c2)
+
+        tr = stats(train.loc[mtr, "target_next_open_ret"])
+        va = stats(valid.loc[mva, "target_next_open_ret"])
+
+        if tr["n"] < min_n_combo:
+            continue
+
+        train_edge = tr["mean"] - base_tr["mean"]
+        valid_edge = va["mean"] - base_va["mean"] if va["n"] else np.nan
+
+        t_valid = welch_t(va["mean"], va["std"], va["n"], base_va["mean"], base_va["std"], base_va["n"])
+        significant = (not np.isnan(t_valid)) and abs(t_valid) >= z_crit
+        enough_n = va["n"] >= max(15, min_n_combo // 2)
+
+        if enough_n and train_edge > 0 and valid_edge > 0 and significant:
+            verdict = "🟢 再現候補"
+        elif enough_n and train_edge > 0 and valid_edge > 0:
+            verdict = "🟡 改善はあるが有意性不足"
+        elif train_edge > 0 and enough_n:
+            verdict = "🟡 検証で再現せず"
+        else:
+            verdict = "⚪ 参考"
+
+        rows.append({
+            "候補1": f"{c1['情報']} {c1['条件']}",
+            "候補2": f"{c2['情報']} {c2['条件']}",
+            "cand1": c1,
+            "cand2": c2,
+            "発見件数": tr["n"],
+            "発見平均": tr["mean"],
+            "発見改善": train_edge,
+            "検証件数": va["n"],
+            "検証平均": va["mean"],
+            "検証改善": valid_edge,
+            "検証t値": t_valid,
+            "判定": verdict,
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out, total_tests, z_crit
+
+    out["再現スコア"] = (
+        out["発見改善"].clip(lower=-9) +
+        out["検証改善"].fillna(-9).clip(lower=-9)
+    )
+    rank = {"🟢 再現候補":0, "🟡 改善はあるが有意性不足":1, "🟡 検証で再現せず":2, "⚪ 参考":3}
+    out["_rank"] = out["判定"].map(rank).fillna(9)
+    out = out.sort_values(["_rank","再現スコア"], ascending=[True,False]).drop(columns="_rank")
+    return out, total_tests, z_crit
+
 def plain_explanation(row, base_tr, base_va):
     feat = row["feature"]
     direction_text = "以下" if row["direction"] == "low" else "以上"
@@ -464,28 +536,28 @@ if not result.empty:
 # 4. 表の読み方
 st.header("④ 表はこう読む")
 st.markdown("""
-**🟢 再現候補**  
+**🟢 再現候補**
 発見期間で無条件より良く、検証期間でも無条件より良く、
-かつ多重検定補正後の基準でも統計的に意味のある差でした。  
+かつ多重検定補正後の基準でも統計的に意味のある差でした。
 → 次に詳しく調べる価値があります。
 
-**🟡 改善はあるが有意性不足**  
-両期間で改善はプラスですが、条件の数（72通り）を考慮すると偶然の範囲内かもしれません。  
+**🟡 改善はあるが有意性不足**
+両期間で改善はプラスですが、条件の数（72通り）を考慮すると偶然の範囲内かもしれません。
 → 参考にはなりますが、単独では採用根拠として弱いです。
 
-**🟡 検証で再現せず**  
-発見期間では良かったのに、未使用の検証期間では基準を上回りませんでした。  
+**🟡 検証で再現せず**
+発見期間では良かったのに、未使用の検証期間では基準を上回りませんでした。
 → 過去に偶然よく見えただけの可能性があります。
 
-**⚪ 参考**  
+**⚪ 参考**
 現時点では優位性が弱い条件です。
 
-**「改善」**  
-その期間の無条件平均と比べて、条件を付けることで平均リターンが何%上がったかです。  
+**「改善」**
+その期間の無条件平均と比べて、条件を付けることで平均リターンが何%上がったかです。
 ここを特に重視します。
 
-**「検証t値」**  
-検証期間の条件付き平均が、無条件平均からサンプルのばらつきに対してどれだけ離れているかの目安です。  
+**「検証t値」**
+検証期間の条件付き平均が、無条件平均からサンプルのばらつきに対してどれだけ離れているかの目安です。
 絶対値が大きいほど「偶然とは考えにくい差」であることを示します（厳密な独立検定ではなく目安）。
 """)
 
@@ -514,12 +586,95 @@ if not result.empty:
         st.metric("平均", f"{x2.mean():+.3f}%" if len(x2) else "—")
         st.metric("上昇率", f"{(x2>0).mean()*100:.1f}%" if len(x2) else "—")
 
-# 6. 次に何をするか
-st.header("⑥ 次に何をすればいい？")
+# 6. 候補を2条件組み合わせて確認する
+st.header("⑥ 気になる候補を2つ選んで、組み合わせても再現するか確認する")
+st.write(
+    "単独では弱くても、2条件を同時に満たす日だけに絞るとさらに改善することがあります。"
+    "ただし条件を重ねるほどサンプル数が減り、偶然の一致も起きやすくなるため、"
+    "ここでも**発見期間・検証期間の両方で改善するか**を同じ基準でチェックします。"
+)
+
+if not result.empty and len(result) >= 2:
+    combo_options = [
+        f"{i+1}. {r['情報']} / {r['条件']} / {r['判定']}"
+        for i, (_, r) in enumerate(result.head(40).iterrows())
+    ]
+    reproducible_idx = [
+        i for i, (_, r) in enumerate(result.head(40).iterrows())
+        if r["判定"] == "🟢 再現候補"
+    ]
+    default_sel = [combo_options[i] for i in reproducible_idx[:3]] if reproducible_idx else combo_options[:2]
+
+    picked = st.multiselect(
+        "組み合わせを試したい候補を2〜5個選んでください（🟢再現候補から選ぶのがおすすめ）",
+        combo_options, default=default_sel
+    )
+    min_n_combo = st.number_input("組み合わせの最低サンプル数", 10, 200, 30, 5)
+
+    if len(picked) < 2:
+        st.info("2つ以上選ぶと、組み合わせの検証結果が表示されます。")
+    else:
+        picked_idx = [int(p.split(".")[0]) - 1 for p in picked]
+        picked_rows = [result.head(40).iloc[i] for i in picked_idx]
+
+        combo_result, combo_tests, combo_z = combo_analyze(
+            train, valid, base_tr, base_va, picked_rows, int(min_n_combo),
+            use_correction=use_correction
+        )
+
+        if use_correction and combo_tests:
+            st.caption(
+                f"🧪 選んだ候補から作れる組み合わせは {combo_tests} 通りです。"
+                f"多重検定補正後、目安として z ≥ {combo_z:.2f} 相当を満たすものだけを🟢再現候補としています。"
+            )
+
+        if combo_result.empty:
+            st.warning(
+                "選んだ候補の組み合わせでは、条件を満たすサンプルが少なすぎるか、"
+                "同じ特徴量どうしの組み合わせしか作れませんでした。別の候補を選んでみてください。"
+            )
+        else:
+            show_combo = combo_result.copy()
+            cols_combo = [
+                "判定","候補1","候補2",
+                "発見件数","発見平均","発見改善",
+                "検証件数","検証平均","検証改善","検証t値"
+            ]
+            show_combo = show_combo[cols_combo]
+            for col in ["発見平均","発見改善","検証平均","検証改善"]:
+                show_combo[col] = show_combo[col].map(lambda x: "—" if pd.isna(x) else f"{x:+.3f}%")
+            show_combo["検証t値"] = show_combo["検証t値"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+            st.dataframe(show_combo, use_container_width=True, hide_index=True)
+
+            combo_green = combo_result[combo_result["判定"] == "🟢 再現候補"]
+            if not combo_green.empty:
+                top_combo = combo_green.iloc[0]
+                c1, c2 = top_combo["cand1"], top_combo["cand2"]
+                st.success(
+                    f"⭐ 最も注目する組み合わせ：**{top_combo['候補1']}** かつ **{top_combo['候補2']}**  "
+                    f"｜検証 {int(top_combo['検証件数'])}件・平均 {top_combo['検証平均']:+.3f}%"
+                )
+                st.markdown(
+                    f"**{c1['情報']} {c1['条件']}** かつ **{c2['情報']} {c2['条件']}** を同時に満たす日だけに絞った条件です。  \n"
+                    f"発見期間では平均 {top_combo['発見平均']:+.3f}%（無条件 {base_tr['mean']:+.3f}%）、"
+                    f"検証期間では平均 {top_combo['検証平均']:+.3f}%（無条件 {base_va['mean']:+.3f}%）でした。  \n"
+                    "**🟢 再現候補**：これでもまだ売買ルールではなく、Aアプリに入れる前の研究候補です。"
+                )
+            else:
+                st.warning(
+                    "選んだ組み合わせの中に、両期間で再現した🟢候補はありませんでした。"
+                    "組み合わせても必ず良くなるわけではない、という結果自体が重要な情報です。"
+                )
+elif not result.empty:
+    st.info("組み合わせを試すには、候補が2件以上必要です。")
+
+# 7. 次に何をするか
+st.header("⑦ 次に何をすればいい？")
 if not result.empty and not result[result["判定"] == "🟢 再現候補"].empty:
     st.write(
-        "まず🟢再現候補を2〜3個に絞ります。次の版では、その候補を**2条件組み合わせても再現するか**を調べます。"
-        "それでも安定していれば、初めてAアプリへの採用候補にします。"
+        "⑥で2条件の組み合わせも確認しました。組み合わせでも🟢が出ていれば、"
+        "その条件を最有力候補として次はAアプリへの採用を慎重に検討します。"
+        "🟢が出ていなければ、単独条件のまま少しフォワード期間で様子を見るのも一つの手です。"
     )
 else:
     st.write(
