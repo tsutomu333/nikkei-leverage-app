@@ -201,9 +201,13 @@ def close_s(df):
 
 def map_prior_us_feature(jp_dates, s, name):
     """日本日付Dに対し、Dより前に終了している直近の米国セッション値を割り当てる。"""
-    left = pd.DataFrame({"jp_date": pd.to_datetime(jp_dates).normalize()}).sort_values("jp_date")
+    # merge_asofは両側のキーのdatetime64の分解能（ns/us/s）が一致していないとエラーになる。
+    # データソースによって分解能が異なりうる（株価データと気象データなど）ため、ns単位に揃える。
+    left = pd.DataFrame({
+        "jp_date": pd.to_datetime(jp_dates).normalize().astype("datetime64[ns]")
+    }).sort_values("jp_date")
     right = pd.DataFrame({
-        "us_date": pd.to_datetime(s.index).normalize(),
+        "us_date": pd.to_datetime(s.index).normalize().astype("datetime64[ns]"),
         name: pd.to_numeric(s.values, errors="coerce")
     }).dropna().sort_values("us_date")
     m = pd.merge_asof(
